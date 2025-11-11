@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Summary and Response</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; line-height: 1.6; max-width: 800px; margin: 2em auto; padding: 0 1em; background-color: #f4f4f9; color: #333; }
+        h1, h2 { color: #111; }
+        .summary-box, .response-section, #responseResult { background-color: white; border-radius: 8px; padding: 1.5em; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
+        audio { width: 100%; margin-top: 1em; }
+        .response-section { margin-top: 2em; border-top: 1px solid #ddd; padding-top: 1.5em; }
+        #recordButton { font-size: 1.1em; padding: 0.8em 1.5em; border-radius: 25px; border: none; cursor: pointer; background-color: #007bff; color: white; transition: all 0.2s ease-in-out; font-weight: 600; }
+        #recordButton:hover { background-color: #0056b3; transform: translateY(-2px); }
+        #recordButton.recording { background-color: #dc3545; }
+        #status { margin-top: 1em; font-style: italic; color: #555; }
+        #responseResult { margin-top: 1em; display: none; white-space: pre-wrap; background-color: #e9ecef; }
+        a { color: #007bff; text-decoration: none; display: inline-block; margin-top: 2em; }
+        a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <h1>Summary</h1>
+    <div class="summary-box">
+        <p><strong>Model:</strong> {{ model }}</p>
+        <p style="white-space: pre-wrap;">{{ summary }}</p>
+        <audio controls autoplay>
+            <source src="{{ audio_path }}" type="audio/mpeg">
+            Your browser does not support the audio element.
+        </audio>
+    </div>
+
+    <div class="response-section">
+        <h2>Respond with your Voice</h2>
+        <p>After listening, click below to record a response like "Confirm" or "Reply, I will be there."</p>
+        <button id="recordButton">Record Response</button>
+        <p id="status"></p>
+        <div id="responseResult"></div>
+    </div>
+    
+    <p><a href="/">Summarize another message</a></p>
+
+    <script>
+        const recordButton = document.getElementById('recordButton');
+        const statusDiv = document.getElementById('status');
+        const responseResultDiv = document.getElementById('responseResult');
+
+        let mediaRecorder;
+        let audioChunks = [];
+        let isRecording = false;
+
+        recordButton.addEventListener('click', async () => {
+            if (isRecording) {
+                mediaRecorder.stop();
+                return; // The onstop event will handle the rest
+            }
+
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+                
+                mediaRecorder.onstart = () => {
+                    isRecording = true;
+                    audioChunks = [];
+                    recordButton.textContent = 'Stop Recording';
+                    recordButton.classList.add('recording');
+                    statusDiv.textContent = 'Recording... Speak now.';
+                    responseResultDiv.style.display = 'none';
+                };
+
+                mediaRecorder.ondataavailable = event => {
+                    audioChunks.push(event.data);
+                };
+
+                mediaRecorder.onstop = async () => {
+                    isRecording = false;
+                    recordButton.textContent = 'Record Response';
+                    recordButton.classList.remove('recording');
+                    statusDiv.textContent = 'Processing...';
+
+                    const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+                    const formData = new FormData();
+                    formData.append('audio', audioBlob, 'response.webm');
+
+                    try {
+                        const response = await fetch('/respond', { method: 'POST', body: formData });
+                        if (!response.ok) throw new Error('Server responded with an error.');
+                        const result = await response.json();
+                        
+                        statusDiv.textContent = 'Response processed successfully.';
+                        responseResultDiv.innerHTML = `<strong>You said:</strong> "${result.transcription}"<br><strong>Action:</strong> ${result.action_taken}`;
+                        responseResultDiv.style.display = 'block';
+                    } catch (error) {
+                        statusDiv.textContent = 'Error processing response. Please try again.';
+                        console.error('Error:', error);
+                    }
+                };
+
+                mediaRecorder.start();
+            } catch (err) {
+                statusDiv.textContent = 'Could not access microphone. Please grant permission.';
+                console.error('Error accessing microphone:', err);
+            }
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,25 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Email → Voice Assistant</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;max-width:800px;margin:40px auto;padding:0 16px}
+    textarea{width:100%;min-height:180px;font-size:16px}
+    .btn{padding:10px 16px;border:0;background:#111;color:#fff;border-radius:8px;cursor:pointer}
+    .card{border:1px solid #ddd;border-radius:12px;padding:16px;margin-top:16px}
+  </style>
+</head>
+<body>
+  <h1>📧 Email → Voice Assistant</h1>
+  <form method="POST" action="/summarize">
+    <label for="text">Paste email text:</label><br>
+    <textarea id="text" name="text" placeholder="Paste email body here..."></textarea><br><br>
+    <button class="btn" type="submit">Summarize & Speak</button>
+  </form>
+  <div class="card">
+    <p><strong>How it works:</strong> summarization by GPT-5-nano → spoken via Realtime AI voice → you can reply by voice!</p>
+  </div>
+</body>
+</html>

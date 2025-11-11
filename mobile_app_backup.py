@@ -1,0 +1,850 @@
+# app.py
+"""
+Conversational Gmail + Calendar Voice Assistant (Single File) - v5.5 (GPT-5-chat-latest Agentic)
+- Voice-first Gmail & Google Calendar assistant with a modern, mobile-first chat UI.
+- Uses tool-calling to search/read/summarize/compose emails AND list/create/update/delete meetings.
+- Audio interrupt: pressing the mic stops current speech.
+- WebSockets for audio + JSON events; TTS + Whisper transcription.
+- FIX v5.5: Implemented robust mobile audio playback using a persistent <audio> element.
+- FIX v5.5: Implemented a mobile-first dark UI with a flawless state machine for the mic button.
+- FIX v5.5: Upgraded the audio server endpoint to support HTTP Range requests for iOS compatibility.
+- FIX v5.5: Reverted to simple/reliable raw audio byte transfer, fixing the "not hearing" bug.
+
+Install:
+  pip install fastapi uvicorn "websockets>=12" httpx python-dotenv \
+              google-auth google-auth-oauthlib google-api-python-client
+
+Run:
+  uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+
+Env (.env):
+  OPENAI_API_KEY=...
+  OPENAI_BASE_URL=https://api.openai.com
+  REALTIME_MODEL=gpt-5-chat-latest
+  REALTIME_VOICE=breeze
+  GOOGLE_CLIENT_ID=xxxxxxxx.apps.googleusercontent.com
+  GOOGLE_CLIENT_SECRET=xxxxxxxx
+  GOOGLE_REDIRECT_URI=http://localhost:8000/gmail/oauth2callback
+"""
+
+import os, io, json, base64, re, uuid, asyncio, traceback, datetime
+from typing import Optional, List, Dict, Any
+from email.message import EmailMessage
+
+import httpx
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Header, Response
+from fastapi.responses import HTMLResponse, StreamingResponse, PlainTextResponse, RedirectResponse
+from dotenv import load_dotenv
+
+# Google / Gmail / Calendar
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import Flow
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+load_dotenv()
+
+# ---------- Configuration ----------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com")
+REALTIME_MODEL = os.getenv("REALTIME_MODEL", "gpt-5-chat-latest")
+REALTIME_VOICE = os.getenv("REALTIME_VOICE", "breeze")
+
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/gmail/oauth2callback")
+
+# Combined scopes for Gmail + Calendar
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/calendar.events",
+]
+
+if not OPENAI_API_KEY:
+    raise RuntimeError("Set OPENAI_API_KEY in environment")
+
+app = FastAPI()
+
+# In-memory demo state (single user)
+_GMAIL_CREDS: Optional[Credentials] = None
+_GENERATED_AUDIO: Dict[str, bytes] = {}  # Store audio clips by UUID
+
+# ---------- Global HTTP client (connection pooling) ----------
+_httpx_client: Optional[httpx.AsyncClient] = None
+
+@app.on_event("startup")
+async def _startup():
+    global _httpx_client
+    _httpx_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(60.0, connect=10.0, read=50.0),
+        headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+        limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
+    )
+
+@app.on_event("shutdown")
+async def _shutdown():
+    global _httpx_client
+    if _httpx_client:
+        await _httpx_client.aclose()
+        _httpx_client = None
+
+def _client() -> httpx.AsyncClient:
+    if not _httpx_client:
+        raise RuntimeError("HTTP client not initialized")
+    return _httpx_client
+
+# ======================= UI / HTML Page =======================
+
+CONVERSATIONAL_HTML = """
+<!doctype html><html><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"/>
+<title>Voice Assistant</title>
+<style>
+  :root {
+    --bg: #111827; --card: #1f2937; --ink: #f9fafb; --muted: #9ca3af;
+    --brand: #818cf8; --brand-hover: #6366f1; --red: #f87171;
+    --border: #374151; --chip: #312e81; --chip-ink: #c7d2fe;
+    --user-bubble-bg: #3730a3; --user-bubble-ink: #e0e7ff;
+  }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html, body { height:100%; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background:var(--bg); color:var(--ink); margin:0;
+    display:flex; flex-direction:column;
+  }
+  .app-container {
+    display:flex; flex-direction:column; height:100%;
+    max-width:800px; width:100%; margin:0 auto; background:var(--bg);
+  }
+  header {
+    padding:12px 16px; border-bottom:1px solid var(--border);
+    display:flex; justify-content:space-between; align-items:center;
+    flex-shrink:0; background: var(--card);
+  }
+  header h1 { font-size:18px; margin:0; }
+  .badge { background:var(--chip); color:var(--chip-ink); border-radius:12px; padding:3px 10px; font-size:12px; font-weight:500; }
+  .chat-container {
+    flex:1 1 auto; overflow-y:auto; padding:16px;
+    display:flex; flex-direction:column; gap:12px;
+  }
+  .bubble {
+    max-width:85%; padding:10px 14px; border-radius:18px; line-height:1.5;
+  }
+  .bubble.user { margin-left:auto; background:var(--user-bubble-bg); color:var(--user-bubble-ink); }
+  .bubble.assistant { margin-right:auto; background:var(--card); }
+  .bubble.system { font-style:italic; text-align:center; background:transparent; color:var(--muted); font-size:13px; padding:6px 10px; border-radius:12px; }
+  .bubble pre { white-space:pre-wrap; font-family:inherit; margin:0; }
+  .draft { border:1px dashed var(--brand); border-radius:12px; padding:12px; background:rgba(31,41,55,0.5); margin-top:8px; }
+  .draft h3 { margin:0 0 8px 0; font-size:14px; color: var(--brand); }
+  .draft pre { white-space:pre-wrap; font-family:inherit; background:var(--bg); border:1px solid var(--border); padding:8px; border-radius:8px; }
+  .draft .actions { display:flex; gap:8px; margin-top:10px; }
+  .btn { padding:10px 14px; border:0; background:var(--brand); color:#fff; border-radius:10px; cursor:pointer; font-size:15px; transition:background-color .2s; }
+  .btn:hover { background:var(--brand-hover); }
+  .btn.secondary { background:#4b5563; color:#fff; }
+  .btn.secondary:hover { background:#6b7280; }
+  .pill { display:inline-block; background:var(--chip); color:var(--chip-ink); border:1px solid var(--brand); padding:2px 8px; border-radius:999px; font-size:11px; margin-top:6px; }
+  .context-display { font-size:12px; color:var(--muted); line-height:1.4; background:var(--card); padding:8px 10px; border-radius:8px; border:1px solid var(--border); }
+  .controls-bar {
+    flex-shrink:0; padding:16px;
+    border-top:1px solid var(--border);
+    text-align:center;
+  }
+  #mic-btn {
+    width:72px; height:72px; border-radius:50%; border:0;
+    background:var(--brand); color:white; cursor:pointer;
+    display:inline-flex; align-items:center; justify-content:center;
+    transition: all .2s; box-shadow: 0 0 0 0 rgba(129, 140, 248, 0);
+  }
+  #mic-btn:disabled { background:var(--muted); cursor:not-allowed; }
+  #mic-btn.listening, #mic-btn.speaking { background:var(--red); animation: pulse 1.5s infinite; }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(248, 113, 113, 0.7); } 70% { box-shadow: 0 0 0 16px rgba(248, 113, 113, 0); } 100% { box-shadow: 0 0 0 0 rgba(248, 113, 113, 0); } }
+  #status-text { color:var(--muted); font-size:14px; margin-top:12px; min-height:20px; }
+  .auth-view { padding: 24px; text-align:center; }
+  .auth-view h2 { margin-top:0; }
+</style>
+</head><body>
+<div id="app-container" class="app-container">
+  <header>
+    <h1>Mail & Calendar</h1><span class="badge">Voice AI</span>
+  </header>
+  <div class="chat-container" id="chat-container">
+    <div id="auth-view" class="auth-view" style="display:none;">
+      <h2>Welcome!</h2>
+      <p id="auth-msg">Please connect your Google account to begin.</p>
+      <a class="btn" id="login-btn" href="/gmail/login">Connect Google</a>
+    </div>
+    <div id="chat-log"></div>
+    <div id="draft-wrap" style="display:none"></div>
+    <div id="context-wrap" style="display:none"></div>
+  </div>
+  <div id="controls" class="controls-bar" style="display:none;">
+    <button id="mic-btn" onclick="handleMicClick()" disabled>
+      <span id="mic-icon-container"></span>
+    </button>
+    <div id="status-text">Checking Google connection...</div>
+  </div>
+</div>
+<!-- Persistent audio element for mobile compatibility -->
+<audio id="audio-player" style="display:none;"></audio>
+
+<script>
+const AppState = { IDLE: 'IDLE', LISTENING: 'LISTENING', PROCESSING: 'PROCESSING', SPEAKING: 'SPEAKING' };
+let state = AppState.IDLE;
+let socket;
+let mediaRecorder;
+let audioChunks = [];
+
+const chatLog = document.getElementById('chat-log');
+const chatContainer = document.getElementById('chat-container');
+const micBtn = document.getElementById('mic-btn');
+const micIconContainer = document.getElementById('mic-icon-container');
+const statusText = document.getElementById('status-text');
+const audioPlayer = document.getElementById('audio-player');
+
+const ICONS = {
+  mic: `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>`,
+  stop: `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect></svg>`,
+};
+
+function setAppState(newState) {
+  state = newState;
+  micBtn.classList.remove('listening', 'speaking');
+  switch (state) {
+    case AppState.IDLE:
+      micIconContainer.innerHTML = ICONS.mic;
+      micBtn.disabled = false;
+      updateStatus('Tap the mic to start.');
+      break;
+    case AppState.LISTENING:
+      micIconContainer.innerHTML = ICONS.stop;
+      micBtn.classList.add('listening');
+      micBtn.disabled = false;
+      updateStatus('Listening... tap to stop.');
+      break;
+    case AppState.PROCESSING:
+      micIconContainer.innerHTML = ICONS.mic;
+      micBtn.disabled = true;
+      updateStatus('Thinking...');
+      break;
+    case AppState.SPEAKING:
+      micIconContainer.innerHTML = ICONS.stop;
+      micBtn.classList.add('speaking');
+      micBtn.disabled = false;
+      break;
+  }
+}
+
+function handleMicClick() {
+  switch (state) {
+    case AppState.IDLE:
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        connectWebSocket().then(startRecording);
+      } else {
+        startRecording();
+      }
+      break;
+    case AppState.LISTENING:
+      stopRecording();
+      break;
+    case AppState.SPEAKING:
+      stopCurrentAudio();
+      setAppState(AppState.IDLE);
+      break;
+  }
+}
+
+function scrollToBottom() { chatContainer.scrollTop = chatContainer.scrollHeight; }
+
+function appendChat(role, text) {
+  const wrap = document.createElement('div');
+  wrap.className = 'bubble ' + role;
+  if (role === 'assistant') {
+    const pre = document.createElement('pre');
+    pre.textContent = text;
+    wrap.appendChild(pre);
+  } else {
+    wrap.textContent = text;
+  }
+  chatLog.appendChild(wrap);
+  scrollToBottom();
+}
+
+function updateContext(info) {
+  let contextWrap = document.getElementById('context-wrap');
+  if (info && info.id) {
+    contextWrap.style.display = 'block';
+    contextWrap.innerHTML = `<div class="context-display"><div><span class="pill">Current Context</span></div><strong>Type:</strong> ${info.type || 'Email'}<br><strong>From/Organizer:</strong> ${info.from || info.organizer || 'N/A'}<br><strong>Subject/Title:</strong> ${info.subject || info.title || 'N/A'}</div>`;
+  } else {
+    contextWrap.style.display = 'none';
+    contextWrap.innerHTML = '';
+  }
+  scrollToBottom();
+}
+
+function showDraft(to, subject, body){
+  const draftWrap = document.getElementById('draft-wrap');
+  draftWrap.innerHTML = `<div class="draft"><h3>Email draft (preview)</h3><div><strong>To:</strong> <span>${to || '(none)'}</span></div><div><strong>Subject:</strong> <span>${subject || '(none)'}</span></div><div style="margin-top:6px;"><strong>Body:</strong></div><pre>${body || ''}</pre><div class="actions"><button class="btn" onclick="sendDraft()">Send</button><button class="btn secondary" onclick="cancelDraft()">Cancel</button></div></div>`;
+  draftWrap.style.display = 'block';
+  scrollToBottom();
+}
+function hideDraft(){ document.getElementById('draft-wrap').style.display = 'none'; }
+function updateStatus(text){ statusText.textContent = text; }
+
+function stopCurrentAudio() {
+  audioPlayer.pause();
+  audioPlayer.src = '';
+}
+
+async function startRecording() {
+  try {
+    stopCurrentAudio();
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    
+    // Use a robust MIME type detection for cross-browser compatibility
+    const mimeType = MediaRecorder.isTypeSupported('audio/webm; codecs=opus') 
+      ? 'audio/webm; codecs=opus' 
+      : 'audio/webm';
+
+    mediaRecorder = new MediaRecorder(stream, { mimeType });
+    audioChunks = [];
+    mediaRecorder.ondataavailable = e => { if (e.data && e.data.size > 0) audioChunks.push(e.data); };
+    mediaRecorder.onstop = () => {
+      stream.getTracks().forEach(t => t.stop());
+      if (socket && socket.readyState === WebSocket.OPEN && audioChunks.length > 0) {
+        const audioBlob = new Blob(audioChunks, { type: mimeType });
+        socket.send(audioBlob);
+        setAppState(AppState.PROCESSING);
+      } else {
+        setAppState(AppState.IDLE);
+      }
+    };
+    mediaRecorder.start();
+    setAppState(AppState.LISTENING);
+  } catch (e) {
+    console.error('Mic error', e);
+    updateStatus('Microphone access denied.');
+    setAppState(AppState.IDLE);
+  }
+}
+
+function stopRecording() {
+  if (mediaRecorder && mediaRecorder.state === 'recording') {
+    mediaRecorder.stop();
+  }
+}
+
+async function checkAuth(){
+  const r = await fetch('/gmail/status'); const j = await r.json();
+  if (j.connected) {
+    document.getElementById('auth-view').style.display = 'none';
+    document.getElementById('controls').style.display = 'block';
+    setAppState(AppState.IDLE);
+  } else {
+    document.getElementById('auth-view').style.display = 'block';
+    document.getElementById('controls').style.display = 'none';
+  }
+}
+
+function connectWebSocket(){
+  return new Promise((resolve, reject) => {
+    updateStatus('Connecting to assistant...');
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    socket = new WebSocket(`${proto}//${window.location.host}/ws`);
+
+    socket.onopen = () => { 
+        appendChat('system', 'Connection established. Tap the mic to begin.');
+        resolve(); 
+    };
+    socket.onclose = () => {
+      updateStatus('Session ended.');
+      setAppState(AppState.IDLE);
+    };
+    socket.onerror = (err) => {
+      console.error('WebSocket Error:', err);
+      updateStatus('Connection error. Please refresh.');
+      setAppState(AppState.IDLE);
+      reject(err);
+    };
+    socket.onmessage = (event) => {
+      let msg; try { msg = JSON.parse(event.data); } catch { return; }
+      switch (msg.type) {
+        case 'play_audio':
+          stopCurrentAudio();
+          updateStatus(msg.status_text);
+          setAppState(AppState.SPEAKING);
+          audioPlayer.src = msg.url;
+          audioPlayer.play().catch(e => {
+            console.error("Audio play failed:", e);
+            // Fallback for browsers that might still block it
+            setAppState(AppState.IDLE);
+          });
+          break;
+        case 'update_status': updateStatus(msg.text); break;
+        case 'chat_append': appendChat(msg.role, msg.text); break;
+        case 'context_update': updateContext(msg.context); break;
+        case 'draft_preview': showDraft(msg.to, msg.subject, msg.body); break;
+        case 'draft_clear': hideDraft(); break;
+      }
+    };
+  });
+}
+
+function sendDraft(){ if(!socket || socket.readyState !== WebSocket.OPEN) return; socket.send(JSON.stringify({ action: 'send_draft' })); }
+function cancelDraft(){ if(!socket || socket.readyState !== WebSocket.OPEN) return; socket.send(JSON.stringify({ action: 'cancel_draft' })); }
+
+audioPlayer.onended = () => {
+    if (state === AppState.SPEAKING) {
+        setAppState(AppState.IDLE);
+    }
+};
+
+checkAuth();
+</script>
+</body></html>
+"""
+
+# ======================= OpenAI & Google Helpers =======================
+
+async def tts_any(text: str) -> str:
+    """Generates audio via TTS, stores it, returns a URL."""
+    payload = {
+        "model": "tts-1", "voice": REALTIME_VOICE, "input": text, "response_format": "mp3"
+    }
+    r = await _client().post(f"{OPENAI_BASE_URL.rstrip('/')}/v1/audio/speech", json=payload)
+    r.raise_for_status()
+    audio_id = str(uuid.uuid4())
+    _GENERATED_AUDIO[audio_id] = r.content
+    return f"/audio/{audio_id}"
+
+async def transcribe_bytes(audio_bytes: bytes) -> str:
+    files = {"file": ("speech.webm", audio_bytes, "audio/webm")}
+    data = {"model": "whisper-1"}
+    r = await _client().post(f"{OPENAI_BASE_URL.rstrip('/')}/v1/audio/transcriptions", data=data, files=files)
+    r.raise_for_status()
+    return r.json().get("text", "").strip()
+
+def _require_google_creds() -> Credentials:
+    global _GMAIL_CREDS
+    if not _GMAIL_CREDS or not _GMAIL_CREDS.valid:
+        raise RuntimeError("Google not connected. Go to / to authenticate.")
+    return _GMAIL_CREDS
+
+def _gmail_service() -> Any:
+    return build("gmail", "v1", credentials=_require_google_creds(), cache_discovery=False)
+
+def _calendar_service() -> Any:
+    return build("calendar", "v3", credentials=_require_google_creds(), cache_discovery=False)
+
+def _get_email_body(msg: Dict) -> str:
+    """Extracts the text/plain body from a Gmail message payload."""
+    body_data = ""
+    if 'parts' in msg.get('payload', {}):
+        for part in msg['payload']['parts']:
+            if part.get('mimeType') == 'text/plain' and 'data' in part.get('body', {}):
+                body_data = base64.urlsafe_b64decode(part['body']['data']).decode('utf-8', errors='ignore')
+                break
+    if not body_data and 'data' in msg.get('payload', {}).get('body', {}):
+        body_data = base64.urlsafe_b64decode(msg['payload']['body']['data']).decode('utf-8', errors='ignore')
+    return body_data
+
+def _parse_rfc3339(dt_str: str) -> str:
+    try:
+        if re.search(r"[+-]\d{2}:\d{2}$", dt_str) or dt_str.endswith("Z"):
+            return dt_str
+        if re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$", dt_str):
+            d = datetime.datetime.strptime(dt_str, "%Y-%m-%d %H:%M")
+            return d.isoformat()
+        if re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$", dt_str):
+            if len(dt_str) == 16:
+                dt_str += ":00"
+            return dt_str
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", dt_str):
+            d = datetime.datetime.strptime(dt_str, "%Y-%m-%d")
+            return d.isoformat()
+    except Exception:
+        pass
+    return dt_str
+
+# ======================= Conversational Logic (Agentic) =======================
+
+SYSTEM_PROMPT = """You are a helpful, conversational Google assistant for Gmail and Calendar.
+- Help the user manage their inbox AND calendar using your voice.
+- Available tools:
+  • Gmail: search, read, summarize, draft new, draft reply, send draft, delete, archive, mark read/unread.
+  • Calendar: list events, read details, quick-add (natural text), create event, update event time, delete event.
+- After calling a tool, ALWAYS tell the user what you did and what you found (concise).
+- When reading long emails, suggest summarizing.
+- When listing events, include start time (with date) and title; include location if present.
+- When creating events, confirm title, start, end, attendees, and location.
+- Keep responses short and actionable. Avoid filler.
+"""
+
+class ConversationManager:
+    def __init__(self, ws: WebSocket):
+        self.ws = ws
+        self.history: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self.last_draft: Optional[Dict[str, str]] = None
+        self.current_email_context: Optional[Dict[str, str]] = None
+        self.current_event_context: Optional[Dict[str, str]] = None
+        self.service_gmail = _gmail_service() if (_GMAIL_CREDS and _GMAIL_CREDS.valid) else None
+        self.service_cal = _calendar_service() if (_GMAIL_CREDS and _GMAIL_CREDS.valid) else None
+
+    async def send_audio_response(self, text: str, status_text: str):
+        await self.ws.send_json({"type": "chat_append", "role": "assistant", "text": text})
+        audio_url = await tts_any(text)
+        await self.ws.send_json({"type": "play_audio", "url": audio_url, "status_text": status_text})
+
+    async def update_status(self, text: str):
+        await self.ws.send_json({"type": "update_status", "text": text})
+
+    async def append_chat(self, role: str, text: str):
+        await self.ws.send_json({"type": "chat_append", "role": role, "text": text})
+
+    async def update_context_display(self):
+        ctx = None
+        if self.current_event_context:
+            ctx = {"id": self.current_event_context.get("id"), "type": "Calendar Event",
+                   "organizer": self.current_event_context.get("organizer"),
+                   "title": self.current_event_context.get("summary")}
+        elif self.current_email_context:
+            ctx = {"id": self.current_email_context.get("id"), "type": "Email",
+                   "from": self.current_email_context.get("from"),
+                   "subject": self.current_email_context.get("subject")}
+        await self.ws.send_json({"type": "context_update", "context": ctx})
+
+    async def show_draft(self, to: str, subject: str, body: str):
+        self.last_draft = {"to": to, "subject": subject, "body": body}
+        await self.ws.send_json({"type": "draft_preview", "to": to, "subject": subject, "body": body})
+
+    async def clear_draft(self):
+        self.last_draft = None
+        await self.ws.send_json({"type": "draft_clear"})
+
+    @property
+    def tools(self):
+        return [
+            {"type": "function", "function": {"name": "gmail_search_emails", "description": "Searches for emails in the user's inbox based on a query.", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "Gmail search query (e.g., 'from:elon@musk.com is:unread')."}, "max_results": {"type": "integer", "description": "Maximum number of emails to return.", "default": 5}}, "required": ["query"]}}},
+            {"type": "function", "function": {"name": "gmail_read_email", "description": "Reads a brief preview of an email and sets it as the current context.", "parameters": {"type": "object", "properties": {"message_id": {"type": "string", "description": "The ID of the message to read. If not provided, uses the current context."}}, "required": []}}},
+            {"type": "function", "function": {"name": "gmail_summarize_email", "description": "Generates a concise summary of the email currently in context.", "parameters": {"type": "object", "properties": {}}}},
+            {"type": "function", "function": {"name": "gmail_draft_new_email", "description": "Creates a draft for a new email (not a reply).", "parameters": {"type": "object", "properties": {"to": {"type": "string"}, "subject": {"type": "string"}, "body": {"type": "string"}}, "required": ["to", "subject", "body"]}}},
+            {"type": "function", "function": {"name": "gmail_draft_reply", "description": "Creates a draft reply to the email in the current context.", "parameters": {"type": "object", "properties": {"body": {"type": "string"}}, "required": ["body"]}}},
+            {"type": "function", "function": {"name": "gmail_send_draft", "description": "Sends the most recently created draft.", "parameters": {"type": "object", "properties": {}}}},
+            {"type": "function", "function": {"name": "gmail_delete_email", "description": "Deletes an email. This is permanent after 30 days.", "parameters": {"type": "object", "properties": {"message_id": {"type": "string"}}, "required": []}}},
+            {"type": "function", "function": {"name": "gmail_archive_email", "description": "Archives an email by removing it from the inbox.", "parameters": {"type": "object", "properties": {"message_id": {"type": "string"}}, "required": []}}},
+            {"type": "function", "function": {"name": "gmail_mark_as_read", "description": "Marks an email as read.", "parameters": {"type": "object", "properties": {"message_id": {"type": "string"}}, "required": []}}},
+            {"type": "function", "function": {"name": "gmail_mark_as_unread", "description": "Marks an email as unread.", "parameters": {"type": "object", "properties": {"message_id": {"type": "string"}}, "required": []}}},
+            {"type": "function", "function": {"name": "calendar_list_events", "description": "Lists upcoming events in the user's primary calendar. Defaults to the next 7 days.", "parameters": {"type": "object", "properties": {"time_min": {"type": "string", "description": "RFC3339 start (e.g., '2025-10-10T00:00:00+02:00')"}, "time_max": {"type": "string", "description": "RFC3339 end"}, "max_results": {"type": "integer", "default": 10}, "query": {"type": "string", "description": "Free text search in events"}}, "required": []}}},
+            {"type": "function", "function": {"name": "calendar_read_event", "description": "Reads details of a specific event and sets it as current context.", "parameters": {"type": "object", "properties": {"event_id": {"type": "string"}}, "required": ["event_id"]}}},
+            {"type": "function", "function": {"name": "calendar_quick_add", "description": "Creates an event from natural language (e.g., 'Lunch with Max tomorrow 13:00').", "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}},
+            {"type": "function", "function": {"name": "calendar_create_event", "description": "Creates a calendar event with explicit fields.", "parameters": {"type": "object", "properties": {"summary": {"type": "string"}, "start_time": {"type": "string", "description": "RFC3339 or 'YYYY-MM-DD HH:MM'"}, "end_time": {"type": "string", "description": "RFC3339 or 'YYYY-MM-DD HH:MM'"}, "timezone": {"type": "string", "description": "IANA TZ like 'Europe/Belgrade'"}, "location": {"type": "string"}, "description": {"type": "string"}, "attendees": {"type": "array", "items": {"type": "string"}, "description": "List of attendee emails"}}, "required": ["summary", "start_time", "end_time"]}}},
+            {"type": "function", "function": {"name": "calendar_update_event_time", "description": "Changes start/end time of an existing event.", "parameters": {"type": "object", "properties": {"event_id": {"type": "string"}, "start_time": {"type": "string"}, "end_time": {"type": "string"}, "timezone": {"type": "string"}}, "required": ["event_id", "start_time", "end_time"]}}},
+            {"type": "function", "function": {"name": "calendar_delete_event", "description": "Deletes an event from the primary calendar.", "parameters": {"type": "object", "properties": {"event_id": {"type": "string"}}, "required": ["event_id"]}}}
+        ]
+
+    def _parse_headers(self, headers: List[Dict]) -> Dict[str, str]:
+        return {h['name'].lower(): h['value'] for h in headers}
+
+    async def gmail_search_emails(self, query: str, max_results: int = 5) -> str:
+        results = self.service_gmail.users().messages().list(userId='me', q=query, maxResults=max_results).execute()
+        messages = results.get('messages', [])
+        if not messages: return f"No emails found matching your search: '{query}'"
+        email_list = []
+        for msg in messages:
+            meta = self.service_gmail.users().messages().get(userId='me', id=msg['id'], format='metadata', metadataHeaders=['From', 'Subject']).execute()
+            headers = self._parse_headers(meta.get('payload', {}).get('headers', []))
+            email_list.append({"id": msg['id'], "from": headers.get('from', 'Unknown Sender').split('<')[0].strip(), "subject": headers.get('subject', '(No Subject)')})
+        return json.dumps(email_list)
+
+    async def gmail_read_email(self, message_id: Optional[str] = None) -> str:
+        target_id = message_id or (self.current_email_context and self.current_email_context.get('id'))
+        if not target_id: return "Error: No message ID provided and no email in context. Ask the user which email they mean."
+        msg = self.service_gmail.users().messages().get(userId='me', id=target_id, format='full').execute()
+        headers = self._parse_headers(msg.get('payload', {}).get('headers', []))
+        body_preview = _get_email_body(msg)[:800]
+        self.current_email_context = {'id': msg['id'], 'threadId': msg['threadId'], 'from': headers.get('from', ''), 'to': headers.get('to', ''), 'subject': headers.get('subject', ''), 'message-id': headers.get('message-id', ''), 'references': headers.get('references', '')}
+        self.current_event_context = None
+        await self.update_context_display()
+        return json.dumps({"from": self.current_email_context['from'], "subject": self.current_email_context['subject'], "summary": msg.get('snippet', 'Could not load snippet.'), "body_preview": body_preview})
+
+    async def gmail_summarize_email(self) -> str:
+        if not self.current_email_context or not self.current_email_context.get('id'): return "Error: No email in context to summarize. Please read an email first."
+        target_id = self.current_email_context['id']
+        msg = self.service_gmail.users().messages().get(userId='me', id=target_id, format='full').execute()
+        full_body = _get_email_body(msg)
+        if not full_body: return "Could not find any content to summarize in this email."
+        summarization_prompt = "Summarize the following email content concisely, focusing on key points, action items, deadlines, and overall sentiment. Speak naturally:\n\n" + full_body
+        payload = {"model": REALTIME_MODEL, "messages": [{"role": "user", "content": summarization_prompt}], "temperature": 0.2}
+        r = await _client().post(f"{OPENAI_BASE_URL.rstrip('/')}/v1/chat/completions", json=payload)
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+
+    async def gmail_draft_new_email(self, to: str, subject: str, body: str) -> str:
+        self.current_email_context = None
+        await self.update_context_display()
+        await self.show_draft(to, subject, body)
+        return "New email draft created and shown to the user. Ask them to confirm sending."
+
+    async def gmail_draft_reply(self, body: str) -> str:
+        if not self.current_email_context: return "Error: No email in context to reply to. Please read an email first."
+        subject = self.current_email_context.get('subject', '')
+        if not subject.lower().startswith("re:"): subject = f"Re: {subject}"
+        await self.show_draft(self.current_email_context['from'], subject, body)
+        return "Reply draft created. Ask user to confirm."
+
+    async def gmail_send_draft(self) -> str:
+        if not self.last_draft: return "Error: No draft available to send."
+        try:
+            profile = self.service_gmail.users().getProfile(userId='me').execute()
+            message = EmailMessage()
+            message.set_content(self.last_draft['body'])
+            message['To'] = self.last_draft['to']
+            message['From'] = profile['emailAddress']
+            message['Subject'] = self.last_draft['subject']
+            if self.current_email_context and self.current_email_context.get('message-id'):
+                message['In-Reply-To'] = self.current_email_context['message-id']
+                refs = self.current_email_context.get('references', '').strip()
+                message['References'] = (refs + " " if refs else "") + self.current_email_context['message-id']
+                body = {'raw': base64.urlsafe_b64encode(message.as_bytes()).decode(), 'threadId': self.current_email_context['threadId']}
+                self.service_gmail.users().messages().send(userId='me', body=body).execute()
+                await self.gmail_mark_as_read(self.current_email_context['id'])
+                result_msg = "Reply sent and the original email has been marked as read."
+            else:
+                body = {'raw': base64.urlsafe_b64encode(message.as_bytes()).decode()}
+                self.service_gmail.users().messages().send(userId='me', body=body).execute()
+                result_msg = "Email sent successfully."
+            await self.clear_draft()
+            self.current_email_context = None
+            await self.update_context_display()
+            return result_msg
+        except HttpError as e: return f"Error sending email: {e}"
+
+    async def _context_action(self, message_id: Optional[str], action_func: callable, success_msg: str, clear_ctx: bool = True) -> str:
+        target_id = message_id or (self.current_email_context and self.current_email_context.get('id'))
+        if not target_id: return "Error: No message ID provided and no email in context."
+        action_func(userId='me', id=target_id).execute()
+        if clear_ctx and self.current_email_context and self.current_email_context.get('id') == target_id:
+            self.current_email_context = None
+            await self.update_context_display()
+        return success_msg.format(id=target_id)
+
+    async def gmail_delete_email(self, message_id: Optional[str] = None) -> str:
+        return await self._context_action(message_id, self.service_gmail.users().messages().trash, "Email {id} deleted.")
+
+    async def gmail_archive_email(self, message_id: Optional[str] = None) -> str:
+        action = lambda **kwargs: self.service_gmail.users().messages().modify(**kwargs, body={'removeLabelIds': ['INBOX']})
+        return await self._context_action(message_id, action, "Email {id} archived.")
+
+    async def gmail_mark_as_read(self, message_id: Optional[str] = None) -> str:
+        action = lambda **kwargs: self.service_gmail.users().messages().modify(**kwargs, body={'removeLabelIds': ['UNREAD']})
+        return await self._context_action(message_id, action, "Email {id} marked as read.", clear_ctx=False)
+
+    async def gmail_mark_as_unread(self, message_id: Optional[str] = None) -> str:
+        action = lambda **kwargs: self.service_gmail.users().messages().modify(**kwargs, body={'addLabelIds': ['UNREAD']})
+        return await self._context_action(message_id, action, "Email {id} marked as unread.", clear_ctx=False)
+
+    async def calendar_list_events(self, time_min: Optional[str] = None, time_max: Optional[str] = None, max_results: int = 10, query: Optional[str] = None) -> str:
+        now = datetime.datetime.utcnow().isoformat() + "Z"
+        if not time_min: time_min = now
+        if time_max is None: time_max = (datetime.datetime.utcnow() + datetime.timedelta(days=7)).isoformat() + "Z"
+        events_result = self.service_cal.events().list(calendarId='primary', timeMin=time_min, timeMax=time_max, maxResults=max_results, q=query or None, singleEvents=True, orderBy='startTime').execute()
+        items = events_result.get('items', [])
+        if not items: return "No upcoming events found in that range."
+        out = []
+        for ev in items:
+            start = ev.get('start', {}).get('dateTime') or ev.get('start', {}).get('date')
+            end = ev.get('end', {}).get('dateTime') or ev.get('end', {}).get('date')
+            out.append({"id": ev.get('id'), "summary": ev.get('summary', '(No title)'), "start": start, "end": end, "location": ev.get('location', ''), "organizer": (ev.get('organizer', {}) or {}).get('email', '')})
+        return json.dumps(out)
+
+    async def calendar_read_event(self, event_id: str) -> str:
+        ev = self.service_cal.events().get(calendarId='primary', eventId=event_id).execute()
+        self.current_event_context = {"id": ev.get('id'), "summary": ev.get('summary', '(No title)'), "organizer": (ev.get('organizer', {}) or {}).get('email', ''), "start": ev.get('start', {}), "end": ev.get('end', {}), "location": ev.get('location', ''), "hangoutLink": ev.get('hangoutLink', '')}
+        self.current_email_context = None
+        await self.update_context_display()
+        return json.dumps(self.current_event_context)
+
+    async def calendar_quick_add(self, text: str) -> str:
+        ev = self.service_cal.events().quickAdd(calendarId='primary', text=text).execute()
+        self.current_event_context = {"id": ev.get('id'), "summary": ev.get('summary', '(No title)'), "organizer": (ev.get('organizer', {}) or {}).get('email', '')}
+        await self.update_context_display()
+        return f"Event created: {ev.get('summary', '(No title)')}"
+
+    async def calendar_create_event(self, summary: str, start_time: str, end_time: str, timezone: Optional[str] = None, location: Optional[str] = None, description: Optional[str] = None, attendees: Optional[List[str]] = None) -> str:
+        start_rfc, end_rfc = _parse_rfc3339(start_time), _parse_rfc3339(end_time)
+        body = {"summary": summary, "start": {"dateTime": start_rfc}, "end": {"dateTime": end_rfc}}
+        if timezone: body["start"]["timeZone"] = timezone; body["end"]["timeZone"] = timezone
+        if location: body["location"] = location
+        if description: body["description"] = description
+        if attendees: body["attendees"] = [{"email": e} for e in attendees]
+        ev = self.service_cal.events().insert(calendarId='primary', body=body, sendUpdates="all").execute()
+        self.current_event_context = {"id": ev.get('id'), "summary": ev.get('summary', summary), "organizer": (ev.get('organizer', {}) or {}).get('email', '')}
+        await self.update_context_display()
+        return f"Event created: {ev.get('summary', summary)} from {start_rfc} to {end_rfc}."
+
+    async def calendar_update_event_time(self, event_id: str, start_time: str, end_time: str, timezone: Optional[str] = None) -> str:
+        ev = self.service_cal.events().get(calendarId='primary', eventId=event_id).execute()
+        start_rfc, end_rfc = _parse_rfc3339(start_time), _parse_rfc3339(end_time)
+        ev['start']['dateTime'], ev['end']['dateTime'] = start_rfc, end_rfc
+        if timezone: ev['start']['timeZone'], ev['end']['timeZone'] = timezone, timezone
+        ev_updated = self.service_cal.events().update(calendarId='primary', eventId=event_id, body=ev, sendUpdates="all").execute()
+        self.current_event_context = {"id": ev_updated.get('id'), "summary": ev_updated.get('summary', '(No title)'), "organizer": (ev_updated.get('organizer', {}) or {}).get('email', '')}
+        await self.update_context_display()
+        return f"Event time updated: {ev_updated.get('summary', '(No title)')} now from {start_rfc} to {end_rfc}."
+
+    async def calendar_delete_event(self, event_id: str) -> str:
+        self.service_cal.events().delete(calendarId='primary', eventId=event_id, sendUpdates="all").execute()
+        if self.current_event_context and self.current_event_context.get("id") == event_id:
+            self.current_event_context = None
+            await self.update_context_display()
+        return "Event deleted."
+
+    async def start(self):
+        if not (self.service_gmail and self.service_cal):
+            await self.send_audio_response("Google is not connected. Please connect it on the web page first.", "Authentication required.")
+            await self.ws.close()
+            return
+        initial_greeting = "Hello! I'm your Mail and Calendar assistant. How can I help?"
+        self.history.append({"role": "assistant", "content": initial_greeting})
+        await self.send_audio_response(initial_greeting, "Ready for your command...")
+
+    async def process_user_message(self, transcript: str):
+        await self.append_chat("user", transcript)
+        self.history.append({"role": "user", "content": transcript})
+        try:
+            payload = {"model": REALTIME_MODEL, "messages": self.history, "tools": self.tools, "tool_choice": "auto"}
+            r = await _client().post(f"{OPENAI_BASE_URL.rstrip('/')}/v1/chat/completions", json=payload)
+            r.raise_for_status()
+            response_message = r.json()["choices"][0]["message"]
+            self.history.append(response_message)
+            if response_message.get("tool_calls"):
+                await self.execute_tool_calls(response_message["tool_calls"])
+            else:
+                await self.send_audio_response(response_message.get("content", ""), "Tap the mic to reply...")
+        except Exception:
+            print(f"[AGENT ERROR] {traceback.format_exc()}")
+            await self.send_audio_response("I hit an error while handling that. Please try again.", "Error")
+
+    async def execute_tool_calls(self, tool_calls: List[Dict]):
+        tool_functions = {
+            "gmail_search_emails": self.gmail_search_emails, "gmail_read_email": self.gmail_read_email, "gmail_summarize_email": self.gmail_summarize_email, "gmail_draft_new_email": self.gmail_draft_new_email, "gmail_draft_reply": self.gmail_draft_reply, "gmail_send_draft": self.gmail_send_draft, "gmail_delete_email": self.gmail_delete_email, "gmail_archive_email": self.gmail_archive_email, "gmail_mark_as_read": self.gmail_mark_as_read, "gmail_mark_as_unread": self.gmail_mark_as_unread,
+            "calendar_list_events": self.calendar_list_events, "calendar_read_event": self.calendar_read_event, "calendar_quick_add": self.calendar_quick_add, "calendar_create_event": self.calendar_create_event, "calendar_update_event_time": self.calendar_update_event_time, "calendar_delete_event": self.calendar_delete_event,
+        }
+        for tool_call in tool_calls:
+            function_name = tool_call['function']['name']
+            function_to_call = tool_functions.get(function_name)
+            function_args = json.loads(tool_call['function']['arguments'] or "{}")
+            function_response = ""
+            await self.append_chat("system", f"Tool: {function_name}({json.dumps(function_args)})")
+            try:
+                if function_to_call: function_response = await function_to_call(**function_args)
+                else: function_response = f"Error: Tool '{function_name}' not found."
+            except Exception:
+                print(f"[TOOL EXECUTION ERROR] in {function_name}: {traceback.format_exc()}")
+                function_response = f"Error executing tool '{function_name}': {traceback.format_exc().splitlines()[-1]}"
+            self.history.append({"tool_call_id": tool_call['id'], "role": "tool", "name": function_name, "content": function_response})
+        payload = {"model": REALTIME_MODEL, "messages": self.history}
+        r = await _client().post(f"{OPENAI_BASE_URL.rstrip('/')}/v1/chat/completions", json=payload)
+        r.raise_for_status()
+        final_response = r.json()["choices"][0]["message"]
+        self.history.append(final_response)
+        await self.send_audio_response(final_response.get("content", ""), "Tap the mic to reply...")
+
+    async def handle_ws_packet(self, data: Dict[str, Any]):
+        action = (data.get("action") or "").lower()
+        if action == "send_draft": await self.process_user_message("Yes, go ahead and send the draft.")
+        elif action == "cancel_draft":
+            await self.clear_draft()
+            await self.process_user_message("Cancel the draft I was working on.")
+
+# ======================= FastAPI Endpoints =======================
+
+@app.get("/", response_class=HTMLResponse)
+async def home():
+    return HTMLResponse(CONVERSATIONAL_HTML)
+
+@app.get("/audio/{audio_id}")
+async def get_audio(audio_id: str, range: Optional[str] = Header(None)):
+    """
+    Handles serving the audio file, supporting HTTP Range requests for streaming on mobile.
+    This is crucial for playback on Safari/iOS.
+    """
+    audio_data = _GENERATED_AUDIO.get(audio_id)
+    if not audio_data:
+        return PlainTextResponse("Not Found", status_code=404)
+
+    file_size = len(audio_data)
+    headers = {"Content-Type": "audio/mpeg", "Accept-Ranges": "bytes", "Cache-Control": "no-store"}
+
+    if range is None:
+        headers["Content-Length"] = str(file_size)
+        return Response(content=audio_data, headers=headers, status_code=200)
+
+    match = re.search(r"bytes=(\d+)-(\d*)", range)
+    if not match:
+        return PlainTextResponse("Invalid Range header", status_code=416)
+
+    start = int(match.group(1))
+    end = int(match.group(2)) if match.group(2) else file_size - 1
+    
+    if start >= file_size or start > end:
+        return PlainTextResponse("Requested range not satisfiable", status_code=416)
+
+    chunk_size = (end - start) + 1
+    content = audio_data[start:end + 1]
+    
+    headers["Content-Length"] = str(chunk_size)
+    headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+    
+    return Response(content=content, headers=headers, status_code=206)
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    manager = ConversationManager(websocket)
+    await manager.start()
+    try:
+        while True:
+            packet = await websocket.receive()
+            if packet.get("type") == "websocket.disconnect": break
+            if packet.get("bytes"):
+                audio_bytes = packet["bytes"]
+                transcript = ""
+                try: transcript = await transcribe_bytes(audio_bytes)
+                except Exception as e: print(f"[STT ERROR] {e}")
+                if not transcript:
+                    await manager.send_audio_response("Sorry, I didn't catch that. Could you say it again?", "Didn't hear you...")
+                    continue
+                await manager.process_user_message(transcript)
+            elif packet.get("text"):
+                try:
+                    data = json.loads(packet["text"])
+                    await manager.handle_ws_packet(data)
+                except Exception: continue
+    except WebSocketDisconnect: print("Client disconnected.")
+    finally: pass
+
+# --- Google OAuth Flow (Gmail + Calendar) ---
+@app.get("/gmail/status")
+def gmail_status():
+    return {"connected": bool(_GMAIL_CREDS and _GMAIL_CREDS.valid)}
+
+@app.get("/gmail/login")
+def gmail_login(request: Request):
+    cfg = {"web": {"client_id": GOOGLE_CLIENT_ID, "client_secret": GOOGLE_CLIENT_SECRET, "redirect_uris": [GOOGLE_REDIRECT_URI], "auth_uri": "https://accounts.google.com/o/oauth2/auth", "token_uri": "https://oauth2.googleapis.com/token"}}
+    flow = Flow.from_client_config(cfg, scopes=GOOGLE_SCOPES, redirect_uri=GOOGLE_REDIRECT_URI)
+    auth_url, state = flow.authorization_url(access_type="offline", include_granted_scopes="true", prompt="consent")
+    app.state.oauth_state = state
+    return RedirectResponse(auth_url)
+
+@app.get("/gmail/oauth2callback")
+async def gmail_oauth2callback(code: str, state: str):
+    if state != getattr(app.state, "oauth_state", None): return PlainTextResponse("Invalid state", status_code=400)
+    cfg = {"web": {"client_id": GOOGLE_CLIENT_ID, "client_secret": GOOGLE_CLIENT_SECRET, "redirect_uris": [GOOGLE_REDIRECT_URI], "auth_uri": "https://accounts.google.com/o/oauth2/auth", "token_uri": "https://oauth2.googleapis.com/token"}}
+    flow = Flow.from_client_config(cfg, scopes=GOOGLE_SCOPES, state=state, redirect_uri=GOOGLE_REDIRECT_URI)
+    flow.fetch_token(code=code)
+    global _GMAIL_CREDS
+    _GMAIL_CREDS = flow.credentials
+    return RedirectResponse("/")
