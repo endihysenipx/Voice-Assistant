@@ -75,6 +75,7 @@ OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com")
 REALTIME_MODEL = os.getenv("REALTIME_MODEL", "gpt-4o-mini")
 REALTIME_VOICE = os.getenv("REALTIME_VOICE", "breeze")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
+RECENT_EMAIL_WINDOW_HOURS = int(os.getenv("RECENT_EMAIL_WINDOW_HOURS", "30"))
 
 
 def _default_redirect(path: str) -> str:
@@ -860,6 +861,17 @@ def _split_recipients(to: str) -> list:
             result.append(addr)
     return result
 
+def _recent_cutoff_utc() -> datetime.datetime:
+    hours = max(1, RECENT_EMAIL_WINDOW_HOURS)
+    return datetime.datetime.now(timezone.utc) - datetime.timedelta(hours=hours)
+
+def _gmail_recent_clause() -> str:
+    cutoff = _recent_cutoff_utc()
+    return f"after:{int(cutoff.timestamp())}"
+
+def _recent_iso_z() -> str:
+    return _recent_cutoff_utc().isoformat().replace("+00:00", "Z")
+
 # --- Google Helpers ---
 def _require_google_creds() -> Credentials:
     creds = _get_google_creds()
@@ -1423,6 +1435,8 @@ class ConversationManager:
             normalized_query = f"in:inbox {normalized_query}".strip()
         if "is:" not in normalized_query.lower() and "label:" not in normalized_query.lower():
             normalized_query = f"{normalized_query} is:unread".strip()
+        if "after:" not in normalized_query.lower():
+            normalized_query = f"{normalized_query} {_gmail_recent_clause()}".strip()
         results = s.users().messages().list(
             userId='me',
             q=normalized_query,
@@ -1646,19 +1660,21 @@ class ConversationManager:
         if publish:
             await self._ensure_account_identity()
         inbox_endpoint = "/me/mailFolders('Inbox')/messages"
+        recent_iso = _recent_iso_z()
         if not query or not query.strip():
             params = {
                 "$orderby": "receivedDateTime desc",
                 "$top": max_results,
                 "$select": "id,subject,from,receivedDateTime,bodyPreview,isRead",
-                "$filter": "isRead eq false"
+                "$filter": f"isRead eq false and receivedDateTime ge {recent_iso}"
             }
             r = await graph_request("GET", inbox_endpoint, params=params)
         else:
             params = {
                 "$search": f'"{query}"',
                 "$top": max_results * 3,
-                "$select": "id,subject,from,receivedDateTime,bodyPreview,isRead"
+                "$select": "id,subject,from,receivedDateTime,bodyPreview,isRead",
+                "$filter": f"receivedDateTime ge {recent_iso}"
             }
             r = await graph_request("GET", inbox_endpoint, params=params)
 
@@ -2010,19 +2026,14 @@ class ConversationManager:
         contacts: List[Dict[str, Any]] = []
         try:
             await self._ensure_account_identity()
-            now_utc = datetime.datetime.now(timezone.utc)
-            start_of_yesterday_utc = (now_utc - datetime.timedelta(days=1)).replace(
-                hour=0, minute=0, second=0, microsecond=0
-            )
-            start_time_iso_utc = start_of_yesterday_utc.isoformat().replace('+00:00', 'Z')
+            cutoff_iso = _recent_iso_z()
 
             if self.service_type == 'google':
-                after_date_str = start_of_yesterday_utc.strftime('%Y/%m/%d')
-                query = f"in:inbox is:unread after:{after_date_str}"
+                query = f"in:inbox is:unread {_gmail_recent_clause()}"
                 unread_json = await self.gmail_search_emails(query=query, max_results=5, publish=False)
             else:
                 params = {
-                    "$filter": f"isRead eq false and receivedDateTime ge {start_time_iso_utc}",
+                    "$filter": f"isRead eq false and receivedDateTime ge {cutoff_iso}",
                     "$top": 5,
                     "$select": "id,subject,from,receivedDateTime,bodyPreview"
                 }
