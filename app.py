@@ -821,6 +821,8 @@ async def tts_any(text: str) -> str:
     payload = {"model": "tts-1", "voice": REALTIME_VOICE, "input": text, "response_format": "mp3"}
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
     r = await _client().post(f"{OPENAI_BASE_URL.rstrip('/')}/v1/audio/speech", json=payload, headers=headers)
+    if r.status_code >= 400:
+        logging.error("OpenAI TTS error %s: %s", r.status_code, r.text)
     r.raise_for_status()
     audio_id = _store_audio_bytes(r.content)
     return f"/audio/{audio_id}"
