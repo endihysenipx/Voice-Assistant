@@ -476,13 +476,11 @@ CONVERSATIONAL_HTML = """
   .pill { display:inline-block; background:var(--chip); color:var(--chip-ink); border:1px solid var(--brand); padding:2px 8px; border-radius:999px; font-size:11px; margin-top:6px; }
   .context-display { font-size:12px; color:var(--muted); line-height:1.4; background:var(--card); padding:8px 10px; border-radius:8px; border:1px solid var(--border); }
   .controls-bar { flex-shrink:0; padding:16px; border-top:1px solid var(--border); text-align:center; }
-  .voice-indicator { display:flex; align-items:center; gap:12px; padding:12px 16px; border-radius:16px; background:var(--card); border:1px solid var(--border); }
-  .voice-dot { width:16px; height:16px; border-radius:50%; background:var(--muted); box-shadow:0 0 0 0 rgba(248,113,113,0); transition:all .2s; flex-shrink:0; }
-  .voice-dot.active { background:var(--red); box-shadow:0 0 12px rgba(248,113,113,0.6); animation:pulse 1.5s infinite; }
-  .voice-copy { display:flex; flex-direction:column; gap:2px; }
-  .voice-status-label { font-size:14px; font-weight:600; color:var(--ink); }
-  .voice-hint { font-size:12px; color:var(--muted); }
-  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(248,113,113,0.7); } 70% { box-shadow: 0 0 0 16px rgba(248,113,113,0); } 100% { box-shadow: 0 0 0 0 rgba(248,113,113,0); } }
+  #mic-btn { width:72px; height:72px; border-radius:50%; border:0; background:var(--brand); color:white; cursor:pointer; display:inline-flex; align-items:center; justify-content:center; transition: all .2s; box-shadow: 0 0 0 0 rgba(129, 140, 248, 0); }
+  #mic-btn:disabled { background:var(--muted); cursor:not-allowed; }
+  #mic-btn.listening, #mic-btn.speaking { background:var(--red); animation: pulse 1.5s infinite; }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(248, 113, 113, 0.7); } 70% { box-shadow: 0 0 0 16px rgba(248, 113, 113, 0); } 100% { box-shadow: 0 0 0 0 rgba(248, 113, 113, 0); }
+  }
   #status-text { color:var(--muted); font-size:14px; margin-top:12px; min-height:20px; }
   .manual-input { margin-top:12px; display:flex; gap:8px; }
   .manual-input input { flex:1; background:var(--card); border:1px solid var(--border); border-radius:10px; padding:10px 12px; color:var(--ink); font-size:14px; }
@@ -532,13 +530,9 @@ CONVERSATIONAL_HTML = """
     </div>
   </div>
   <div id="controls" class="controls-bar" style="display:none;">
-    <div class="voice-indicator">
-      <div id="voice-dot" class="voice-dot"></div>
-      <div class="voice-copy">
-        <div id="voice-status-label" class="voice-status-label">Standby</div>
-        <div id="voice-hint" class="voice-hint">Waiting for connection...</div>
-      </div>
-    </div>
+    <button id="mic-btn" onclick="handleMicClick()" disabled>
+      <span id="mic-icon-container"></span>
+    </button>
     <div id="status-text">Checking connection...</div>
     <div class="manual-input">
       <input id="text-input" type="text" placeholder="Type a message..." autocomplete="off"/>
@@ -546,47 +540,15 @@ CONVERSATIONAL_HTML = """
     </div>
   </div>
 </div>
-<audio id="audio-player" style="display:none;" playsinline preload="auto"></audio>
+<audio id="audio-player" style="display:none;"></audio>
 <script>
 const AppState = { IDLE: 'IDLE', LISTENING: 'LISTENING', PROCESSING: 'PROCESSING', SPEAKING: 'SPEAKING' };
-let state = AppState.IDLE;
-let socket;
-let socketPromise = null;
-let mediaRecorder;
-let micStream;
-let audioChunks = [];
-let audioCtx;
-let analyser;
-let analyserData;
-let vadInterval;
-let lastSpeechEvent = 0;
-let microphoneReady = false;
-let reconnectTimer = null;
-let pendingMicUnlock = false;
-let audioUnlocked = false;
-let audioUnlockListenersActive = false;
-const SILENT_AUDIO_SRC = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=";
-let pendingAudioUrl = null;
-let vadNoiseFloor = 0.01;
-let vadSpeechFrames = 0;
-let vadIsSpeaking = false;
-const VAD_INTERVAL_MS = 120;
-const SILENCE_HANG_MS = 700;
-const VAD_THRESHOLD = 0.02;
-const VAD_MIN_ENERGY = 0.02;
-const VAD_SIGNAL_DELTA = 0.015;
-const VAD_SPEECH_FRAMES_REQUIRED = 3;
-const VAD_NOISE_ADAPT_ALPHA = 0.04;
-const chatLog = document.getElementById('chat-log');
-const chatContainer = document.getElementById('chat-container');
-const voiceDot = document.getElementById('voice-dot');
-const voiceStatusLabel = document.getElementById('voice-status-label');
-const voiceHint = document.getElementById('voice-hint');
-const statusText = document.getElementById('status-text');
-const audioPlayer = document.getElementById('audio-player');
+let state = AppState.IDLE; let socket; let mediaRecorder; let audioChunks = [];
+const chatLog = document.getElementById('chat-log'); const chatContainer = document.getElementById('chat-container'); const micBtn = document.getElementById('mic-btn'); const micIconContainer = document.getElementById('mic-icon-container'); const statusText = document.getElementById('status-text'); const audioPlayer = document.getElementById('audio-player');
 const suggestionsWrap = document.getElementById('suggestions-wrap'); const textInput = document.getElementById('text-input'); const sendBtn = document.getElementById('send-btn'); const peoplePanel = document.getElementById('people-panel'); const peopleList = document.getElementById('people-list');
 const authView = document.getElementById('auth-view'); const controls = document.getElementById('controls'); const authButtons = document.getElementById('auth-buttons');
 const authMsg = document.getElementById('auth-msg'); const connectGoogle = document.getElementById('connect-google'); const connectOutlook = document.getElementById('connect-outlook'); const serviceNameElem = document.getElementById('service-name');
+const ICONS = { mic: `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>`, stop: `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect></svg>`};
 
 function renderPeopleList(items){
   if (!peoplePanel || !peopleList) return;
@@ -694,237 +656,29 @@ function renderSuggestions(items){
   });
 }
 
-function updateVoiceIndicator(label, hint) {
-  if (voiceStatusLabel && label) voiceStatusLabel.textContent = label;
-  if (voiceHint && hint) voiceHint.textContent = hint;
-}
 function setAppState(newState) {
-  state = newState;
-  if (voiceDot) {
-    const shouldPulse = state === AppState.LISTENING || state === AppState.SPEAKING;
-    voiceDot.classList.toggle('active', shouldPulse);
-  }
+  state = newState; micBtn.classList.remove('listening', 'speaking');
   switch (state) {
-    case AppState.IDLE:
-      updateVoiceIndicator('Standby', microphoneReady ? 'Speak naturally whenever you are ready.' : 'Waiting for microphone access...');
-      updateStatus('Standing by...');
-      break;
-    case AppState.LISTENING:
-      updateVoiceIndicator('Listening', 'I paused so you can speak freely.');
-      updateStatus('Listening...');
-      break;
-    case AppState.PROCESSING:
-      updateVoiceIndicator('Thinking', 'Give me a moment to work on that.');
-      updateStatus('Thinking...');
-      break;
-    case AppState.SPEAKING:
-      updateVoiceIndicator('Speaking', 'Interrupt me whenever you need.');
-      updateStatus('Responding...');
-      break;
+    case AppState.IDLE: micIconContainer.innerHTML = ICONS.mic; micBtn.disabled = false; updateStatus('Tap the mic to start.'); break;
+    case AppState.LISTENING: micIconContainer.innerHTML = ICONS.stop; micBtn.classList.add('listening'); micBtn.disabled = false; updateStatus('Listening... tap to stop.'); break;
+    case AppState.PROCESSING: micIconContainer.innerHTML = ICONS.mic; micBtn.disabled = true; updateStatus('Thinking...'); break;
+    case AppState.SPEAKING: micIconContainer.innerHTML = ICONS.stop; micBtn.classList.add('speaking'); micBtn.disabled = false; break;
   }
   const socketReady = socket && socket.readyState === WebSocket.OPEN;
   const disableManual = !socketReady || state === AppState.LISTENING || state === AppState.PROCESSING;
   if (textInput) textInput.disabled = disableManual;
   if (sendBtn) sendBtn.disabled = disableManual;
 }
-
-function ensureAudioContext() {
-  if (!audioCtx) {
-    const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
-    audioCtx = AudioContextCtor ? new AudioContextCtor() : null;
+function handleMicClick() {
+  renderSuggestions([]);
+  switch (state) {
+    case AppState.IDLE:
+      if (!socket || socket.readyState !== WebSocket.OPEN) { connectWebSocket().then(startRecording); }
+      else { startRecording(); }
+      break;
+    case AppState.LISTENING: stopRecording(); break;
+    case AppState.SPEAKING: stopCurrentAudio(); setAppState(AppState.IDLE); break;
   }
-  return audioCtx;
-}
-
-function startVadLoop() {
-  if (!analyser || vadInterval) return;
-  vadInterval = setInterval(() => {
-    if (!analyser || !analyserData) return;
-    analyser.getByteTimeDomainData(analyserData);
-    let sum = 0;
-    for (let i = 0; i < analyserData.length; i += 1) {
-      const sample = (analyserData[i] - 128) / 128;
-      sum += sample * sample;
-    }
-    const rms = Math.sqrt(sum / analyserData.length);
-    const now = performance.now();
-    const dynamicThreshold = Math.max(VAD_THRESHOLD, vadNoiseFloor + VAD_SIGNAL_DELTA);
-    const aboveThreshold = rms > dynamicThreshold && rms > VAD_MIN_ENERGY;
-
-    if (!aboveThreshold && !vadIsSpeaking) {
-      vadNoiseFloor = (1 - VAD_NOISE_ADAPT_ALPHA) * vadNoiseFloor + VAD_NOISE_ADAPT_ALPHA * rms;
-    }
-
-    if (aboveThreshold) {
-      vadSpeechFrames = Math.min(VAD_SPEECH_FRAMES_REQUIRED, vadSpeechFrames + 1);
-    } else if (vadSpeechFrames > 0) {
-      vadSpeechFrames -= 1;
-    }
-
-    if (!vadIsSpeaking && vadSpeechFrames >= VAD_SPEECH_FRAMES_REQUIRED) {
-      vadIsSpeaking = true;
-      lastSpeechEvent = now;
-      if (state === AppState.SPEAKING) {
-        stopCurrentAudio();
-      }
-      if (mediaRecorder && mediaRecorder.state !== 'recording') {
-        try {
-          audioChunks = [];
-          mediaRecorder.start();
-          setAppState(AppState.LISTENING);
-        } catch (err) {
-          console.error('MediaRecorder start failure', err);
-        }
-      }
-    } else if (vadIsSpeaking && aboveThreshold) {
-      lastSpeechEvent = now;
-    } else if (vadIsSpeaking && now - lastSpeechEvent > SILENCE_HANG_MS) {
-      vadIsSpeaking = false;
-      vadSpeechFrames = 0;
-      if (mediaRecorder && mediaRecorder.state === 'recording') {
-        mediaRecorder.stop();
-      }
-    }
-  }, VAD_INTERVAL_MS);
-}
-
-function disableAudioUnlockListeners() {
-  if (!audioUnlockListenersActive) return;
-  audioUnlockListenersActive = false;
-  ['touchstart', 'pointerdown', 'click'].forEach((evt) => {
-    window.removeEventListener(evt, unlockAudioPlayback);
-  });
-}
-
-function enableAudioUnlockListeners() {
-  if (audioUnlocked || audioUnlockListenersActive) return;
-  audioUnlockListenersActive = true;
-  ['touchstart', 'pointerdown', 'click'].forEach((evt) => {
-    window.addEventListener(evt, unlockAudioPlayback, { passive: true });
-  });
-}
-
-function unlockAudioPlayback() {
-  if (audioUnlocked || !audioPlayer) return;
-  try {
-    const resumeUrl = pendingAudioUrl;
-    audioPlayer.src = SILENT_AUDIO_SRC;
-    audioPlayer.muted = true;
-    const playPromise = audioPlayer.play();
-    const finalize = () => {
-      audioPlayer.pause();
-      audioPlayer.currentTime = 0;
-      audioPlayer.muted = false;
-      audioPlayer.removeAttribute('src');
-      audioUnlocked = true;
-      disableAudioUnlockListeners();
-      if (resumeUrl) {
-        const pending = resumeUrl;
-        pendingAudioUrl = null;
-        setTimeout(() => attemptAudioPlayback(pending), 0);
-      }
-    };
-    if (playPromise && playPromise.then) {
-      playPromise.then(finalize).catch((err) => {
-        console.warn('Audio unlock failed', err);
-        audioPlayer.muted = false;
-        enableAudioUnlockListeners();
-      });
-    } else {
-      finalize();
-    }
-  } catch (err) {
-    console.warn('Audio unlock error', err);
-  }
-}
-
-function queueMicUnlockRetry() {
-  if (pendingMicUnlock) return;
-  pendingMicUnlock = true;
-  const handler = () => {
-    pendingMicUnlock = false;
-    window.removeEventListener('click', handler);
-    ensureVoiceAccess().catch(() => {});
-  };
-  window.addEventListener('click', handler, { once: true });
-  enableAudioUnlockListeners();
-}
-
-async function ensureVoiceAccess() {
-  if (microphoneReady) return;
-  try {
-    micStream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true }
-    });
-  } catch (err) {
-    console.error('Microphone error', err);
-    updateVoiceIndicator('Microphone blocked', 'Click anywhere to allow microphone access.');
-    updateStatus('Microphone access denied.');
-    queueMicUnlockRetry();
-    throw err;
-  }
-  microphoneReady = true;
-  const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm';
-  mediaRecorder = new MediaRecorder(micStream, { mimeType });
-  mediaRecorder.ondataavailable = (e) => {
-    if (e.data && e.data.size > 0) {
-      audioChunks.push(e.data);
-    }
-  };
-  mediaRecorder.onstop = () => {
-    vadIsSpeaking = false;
-    vadSpeechFrames = 0;
-    if (!audioChunks.length) {
-      setAppState(AppState.IDLE);
-      return;
-    }
-    const blob = new Blob(audioChunks.slice(), { type: mimeType });
-    audioChunks = [];
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(blob);
-      setAppState(AppState.PROCESSING);
-    } else {
-      setAppState(AppState.IDLE);
-    }
-  };
-  const ctx = ensureAudioContext();
-  if (ctx) {
-    analyser = ctx.createAnalyser();
-    analyser.fftSize = 2048;
-    analyserData = new Uint8Array(analyser.fftSize);
-    const source = ctx.createMediaStreamSource(micStream);
-    source.connect(analyser);
-    startVadLoop();
-  } else {
-    console.warn('AudioContext unsupported; fallback to manual input only.');
-  }
-  setAppState(AppState.IDLE);
-}
-
-function stopVoiceInfrastructure() {
-  if (vadInterval) {
-    clearInterval(vadInterval);
-    vadInterval = null;
-  }
-  if (mediaRecorder && mediaRecorder.state === 'recording') {
-    mediaRecorder.stop();
-  }
-  analyser = null;
-  analyserData = null;
-  if (micStream) {
-    micStream.getTracks().forEach((track) => track.stop());
-    micStream = null;
-  }
-  if (audioCtx && typeof audioCtx.close === 'function') {
-    audioCtx.close().catch(() => {});
-  }
-  audioCtx = null;
-  mediaRecorder = null;
-  microphoneReady = false;
-  vadNoiseFloor = 0.01;
-  vadIsSpeaking = false;
-  vadSpeechFrames = 0;
-  lastSpeechEvent = 0;
 }
 function scrollToBottom() { chatContainer.scrollTop = chatContainer.scrollHeight; }
 function appendChat(role, text) { const wrap = document.createElement('div'); wrap.className = 'bubble ' + role; if (role === 'assistant') { const pre = document.createElement('pre'); pre.textContent = text; wrap.appendChild(pre); } else { wrap.textContent = text; } chatLog.appendChild(wrap); scrollToBottom(); }
@@ -946,37 +700,26 @@ function updateContext(info) {
 function showDraft(to, subject, body){ const draftWrap = document.getElementById('draft-wrap'); draftWrap.innerHTML = `<div class="draft"><h3>Email draft (preview)</h3><div><strong>To:</strong> <span>${to || '(none)'}</span></div><div><strong>Subject:</strong> <span>${subject || '(none)'}</span></div><div style="margin-top:6px;"><strong>Body:</strong></div><pre>${body || ''}</pre><div class="actions"><button class="btn" onclick="sendDraft()">Send</button><button class="btn secondary" onclick="cancelDraft()">Cancel</button></div></div>`; draftWrap.style.display = 'block'; scrollToBottom(); }
 function hideDraft(){ document.getElementById('draft-wrap').style.display = 'none'; }
 function updateStatus(text){ statusText.textContent = text; }
-function stopCurrentAudio() {
-  audioPlayer.pause();
-  audioPlayer.currentTime = 0;
-  audioPlayer.removeAttribute('src');
-  pendingAudioUrl = null;
+function stopCurrentAudio() { audioPlayer.pause(); audioPlayer.src = ''; }
+async function startRecording() {
+  try {
+    stopCurrentAudio();
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const mimeType = MediaRecorder.isTypeSupported('audio/webm; codecs=opus') ? 'audio/webm; codecs=opus' : 'audio/webm';
+    mediaRecorder = new MediaRecorder(stream, { mimeType }); audioChunks = [];
+    mediaRecorder.ondataavailable = e => { if (e.data && e.data.size > 0) audioChunks.push(e.data); };
+    mediaRecorder.onstop = () => {
+      stream.getTracks().forEach(t => t.stop());
+      if (socket && socket.readyState === WebSocket.OPEN && audioChunks.length > 0) {
+        const audioBlob = new Blob(audioChunks, { type: mimeType });
+        socket.send(audioBlob);
+        setAppState(AppState.PROCESSING);
+      } else { setAppState(AppState.IDLE); }
+    };
+    mediaRecorder.start(); setAppState(AppState.LISTENING);
+  } catch (e) { console.error('Mic error', e); updateStatus('Microphone access denied.'); setAppState(AppState.IDLE); }
 }
-
-function attemptAudioPlayback(url) {
-  if (!audioPlayer || !url) return;
-  pendingAudioUrl = url;
-  audioPlayer.src = url;
-  const playPromise = audioPlayer.play();
-  if (!playPromise || typeof playPromise.catch !== 'function') {
-    pendingAudioUrl = null;
-    return;
-  }
-  playPromise.then(() => {
-    pendingAudioUrl = null;
-  }).catch((err) => {
-    if (err && err.name === 'NotAllowedError') {
-      updateVoiceIndicator('Enable audio', 'Tap anywhere so I can speak aloud.');
-      enableAudioUnlockListeners();
-    } else {
-      pendingAudioUrl = null;
-      console.error('Audio play failed:', err);
-    }
-    if (state === AppState.SPEAKING) {
-      setAppState(AppState.IDLE);
-    }
-  });
-}
+function stopRecording() { if (mediaRecorder && mediaRecorder.state === 'recording') { mediaRecorder.stop(); } }
 function sendManualMessage(textOverride){
   if (!socket || socket.readyState !== WebSocket.OPEN) return;
   const raw = textOverride !== undefined ? textOverride : (textInput ? textInput.value : '');
@@ -1020,97 +763,41 @@ async function checkAuth(){
     renderPeopleList([]);
     if (!anyAvailable) {
       updateStatus('Waiting for server configuration...');
+      if (micBtn) micBtn.disabled = true;
     } else {
-      updateStatus('Connect Gmail or Outlook to start talking.');
+      updateStatus('Tap Connect to link Gmail or Outlook.');
     }
-    stopVoiceInfrastructure();
-    setAppState(AppState.IDLE);
   } else {
     if (authView) authView.style.display = 'none';
     if (controls) controls.style.display = 'block';
     serviceNameElem.textContent = payload.connected_service === 'google' ? 'Gmail' : 'Outlook';
     renderPeopleList([]);
-    try {
-      await connectWebSocket();
-      await ensureVoiceAccess();
-    } catch (err) {
-      console.error('Realtime setup error', err);
-    }
+    micBtn.disabled = false;
+    connectWebSocket();
   }
 }
 function connectWebSocket(){
-  if (socket && socket.readyState === WebSocket.OPEN) {
-    return Promise.resolve();
-  }
-  if (socketPromise) return socketPromise;
-  updateStatus('Connecting to assistant...');
-  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  socketPromise = new Promise((resolve, reject) => {
+  return new Promise((resolve, reject) => {
+    updateStatus('Connecting to assistant...');
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     socket = new WebSocket(`${proto}//${window.location.host}/ws`);
-    socket.onopen = () => {
-      if (reconnectTimer) {
-        clearTimeout(reconnectTimer);
-        reconnectTimer = null;
-      }
-      appendChat('system', 'Connection established. Assistant is starting...');
-      renderSuggestions([]);
-      renderPeopleList([]);
-      setAppState(AppState.IDLE);
-      resolve();
-    };
-    socket.onclose = () => {
-      socket = null;
-      updateStatus('Session ended.');
-      renderSuggestions([]);
-      renderPeopleList([]);
-      setAppState(AppState.IDLE);
-      if (!reconnectTimer && controls && controls.style.display !== 'none') {
-        reconnectTimer = setTimeout(() => {
-          reconnectTimer = null;
-          connectWebSocket().catch(() => {});
-        }, 1500);
-      }
-    };
-    socket.onerror = (err) => {
-      socket = null;
-      console.error('WebSocket Error:', err);
-      updateStatus('Connection error. Please refresh.');
-      setAppState(AppState.IDLE);
-      reject(err);
-    };
+    socket.onopen = () => { appendChat('system', 'Connection established. Assistant is starting...'); renderSuggestions([]); renderPeopleList([]); setAppState(state); resolve(); };
+    socket.onclose = () => { updateStatus('Session ended.'); renderSuggestions([]); renderPeopleList([]); setAppState(AppState.IDLE); };
+    socket.onerror = (err) => { console.error('WebSocket Error:', err); updateStatus('Connection error. Please refresh.'); setAppState(AppState.IDLE); reject(err); };
     socket.onmessage = (event) => {
       let msg; try { msg = JSON.parse(event.data); } catch { return; }
       switch (msg.type) {
-        case 'play_audio':
-          stopCurrentAudio();
-          updateStatus(msg.status_text);
-          setAppState(AppState.SPEAKING);
-          attemptAudioPlayback(msg.url);
-          break;
-        case 'update_status':
-          updateStatus(msg.text);
-          break;
-        case 'chat_append':
-          appendChat(msg.role, msg.text);
-          break;
-        case 'context_update':
-          updateContext(msg.context);
-          break;
-        case 'draft_preview':
-          showDraft(msg.to, msg.subject, msg.body);
-          break;
-        case 'draft_clear':
-          hideDraft();
-          break;
-        case 'suggestions':
-          renderSuggestions(msg.items || []); break;
-        case 'people_list':
-          renderPeopleList(msg.people || []); break;
+        case 'play_audio': stopCurrentAudio(); updateStatus(msg.status_text); setAppState(AppState.SPEAKING); audioPlayer.src = msg.url; audioPlayer.play().catch(e => { console.error("Audio play failed:", e); setAppState(AppState.IDLE); }); break;
+        case 'update_status': updateStatus(msg.text); break;
+        case 'chat_append': appendChat(msg.role, msg.text); break;
+        case 'context_update': updateContext(msg.context); break;
+        case 'draft_preview': showDraft(msg.to, msg.subject, msg.body); break;
+        case 'draft_clear': hideDraft(); break;
+        case 'suggestions': renderSuggestions(msg.items || []); break;
+        case 'people_list': renderPeopleList(msg.people || []); break;
       }
     };
   });
-  socketPromise.finally(() => { socketPromise = null; });
-  return socketPromise;
 }
 function sendDraft(){ if(!socket || socket.readyState !== WebSocket.OPEN) return; socket.send(JSON.stringify({ action: 'send_draft' })); }
 function cancelDraft(){ if(!socket || socket.readyState !== WebSocket.OPEN) return; socket.send(JSON.stringify({ action: 'cancel_draft' })); }
@@ -1120,7 +807,6 @@ if (textInput) {
     if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); sendManualMessage(); }
   });
 }
-enableAudioUnlockListeners();
 renderPeopleList([]);
 renderSuggestions([]);
 setAppState(AppState.IDLE);
@@ -2481,14 +2167,14 @@ class ConversationManager:
             r = await client.post(f"{OPENAI_BASE_URL.rstrip('/')}/v1/chat/completions", json=payload, headers=headers)
             if r.status_code >= 400:
                 print(f"[OPENAI 4xx] {r.status_code} :: {r.text[:5000]}")
-                await self.send_audio_response("I had trouble understanding that. Can you rephrase?", "Say it again whenever you're ready.")
+                await self.send_audio_response("I had trouble understanding that. Can you rephrase?", "Tap the mic to reply...")
                 return
             response_message = r.json()["choices"][0]["message"]
             self.history.append(response_message)
             if response_message.get("tool_calls"):
                 await self.execute_tool_calls(response_message["tool_calls"])
             else:
-                await self.send_audio_response(response_message.get("content", ""), "Ask another question whenever you like.")
+                await self.send_audio_response(response_message.get("content", ""), "Tap the mic to reply...")
         except Exception:
             print(f"[AGENT ERROR] {traceback.format_exc()}")
             await self.send_audio_response("I hit an error. Please try again.", "Error")
@@ -2540,11 +2226,11 @@ class ConversationManager:
         r = await client.post(f"{OPENAI_BASE_URL.rstrip('/')}/v1/chat/completions", json=payload, headers=headers)
         if r.status_code >= 400:
             print(f"[OPENAI 4xx after tools] {r.status_code} :: {r.text[:5000]}")
-            await self.send_audio_response("Done. Anything else?", "Just start talking to continue.")
+            await self.send_audio_response("Done. Anything else?", "Tap the mic to reply...")
             return
         final_response = r.json()["choices"][0]["message"]
         self.history.append(final_response)
-        await self.send_audio_response(final_response.get("content", ""), "Jump back in whenever you like.")
+        await self.send_audio_response(final_response.get("content", ""), "Tap the mic to reply...")
 
     async def handle_ws_packet(self, data: Dict[str, Any]):
         action = (data.get("action") or "").lower()
