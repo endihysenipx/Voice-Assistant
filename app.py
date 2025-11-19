@@ -546,7 +546,7 @@ CONVERSATIONAL_HTML = """
     </div>
   </div>
 </div>
-<audio id="audio-player" style="display:none;"></audio>
+<audio id="audio-player" style="display:none;" playsinline preload="auto"></audio>
 <script>
 const AppState = { IDLE: 'IDLE', LISTENING: 'LISTENING', PROCESSING: 'PROCESSING', SPEAKING: 'SPEAKING' };
 let state = AppState.IDLE;
@@ -563,6 +563,10 @@ let lastSpeechEvent = 0;
 let microphoneReady = false;
 let reconnectTimer = null;
 let pendingMicUnlock = false;
+let audioUnlocked = false;
+let audioUnlockListenersActive = false;
+const SILENT_AUDIO_SRC = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=";
+let pendingAudioUrl = null;
 let vadNoiseFloor = 0.01;
 let vadSpeechFrames = 0;
 let vadIsSpeaking = false;
@@ -784,6 +788,56 @@ function startVadLoop() {
   }, VAD_INTERVAL_MS);
 }
 
+function disableAudioUnlockListeners() {
+  if (!audioUnlockListenersActive) return;
+  audioUnlockListenersActive = false;
+  ['touchstart', 'pointerdown', 'click'].forEach((evt) => {
+    window.removeEventListener(evt, unlockAudioPlayback);
+  });
+}
+
+function enableAudioUnlockListeners() {
+  if (audioUnlocked || audioUnlockListenersActive) return;
+  audioUnlockListenersActive = true;
+  ['touchstart', 'pointerdown', 'click'].forEach((evt) => {
+    window.addEventListener(evt, unlockAudioPlayback, { passive: true });
+  });
+}
+
+function unlockAudioPlayback() {
+  if (audioUnlocked || !audioPlayer) return;
+  try {
+    const resumeUrl = pendingAudioUrl;
+    audioPlayer.src = SILENT_AUDIO_SRC;
+    audioPlayer.muted = true;
+    const playPromise = audioPlayer.play();
+    const finalize = () => {
+      audioPlayer.pause();
+      audioPlayer.currentTime = 0;
+      audioPlayer.muted = false;
+      audioPlayer.removeAttribute('src');
+      audioUnlocked = true;
+      disableAudioUnlockListeners();
+      if (resumeUrl) {
+        const pending = resumeUrl;
+        pendingAudioUrl = null;
+        setTimeout(() => attemptAudioPlayback(pending), 0);
+      }
+    };
+    if (playPromise && playPromise.then) {
+      playPromise.then(finalize).catch((err) => {
+        console.warn('Audio unlock failed', err);
+        audioPlayer.muted = false;
+        enableAudioUnlockListeners();
+      });
+    } else {
+      finalize();
+    }
+  } catch (err) {
+    console.warn('Audio unlock error', err);
+  }
+}
+
 function queueMicUnlockRetry() {
   if (pendingMicUnlock) return;
   pendingMicUnlock = true;
@@ -793,6 +847,7 @@ function queueMicUnlockRetry() {
     ensureVoiceAccess().catch(() => {});
   };
   window.addEventListener('click', handler, { once: true });
+  enableAudioUnlockListeners();
 }
 
 async function ensureVoiceAccess() {
@@ -894,7 +949,33 @@ function updateStatus(text){ statusText.textContent = text; }
 function stopCurrentAudio() {
   audioPlayer.pause();
   audioPlayer.currentTime = 0;
-  audioPlayer.src = '';
+  audioPlayer.removeAttribute('src');
+  pendingAudioUrl = null;
+}
+
+function attemptAudioPlayback(url) {
+  if (!audioPlayer || !url) return;
+  pendingAudioUrl = url;
+  audioPlayer.src = url;
+  const playPromise = audioPlayer.play();
+  if (!playPromise || typeof playPromise.catch !== 'function') {
+    pendingAudioUrl = null;
+    return;
+  }
+  playPromise.then(() => {
+    pendingAudioUrl = null;
+  }).catch((err) => {
+    if (err && err.name === 'NotAllowedError') {
+      updateVoiceIndicator('Enable audio', 'Tap anywhere so I can speak aloud.');
+      enableAudioUnlockListeners();
+    } else {
+      pendingAudioUrl = null;
+      console.error('Audio play failed:', err);
+    }
+    if (state === AppState.SPEAKING) {
+      setAppState(AppState.IDLE);
+    }
+  });
 }
 function sendManualMessage(textOverride){
   if (!socket || socket.readyState !== WebSocket.OPEN) return;
@@ -1004,8 +1085,7 @@ function connectWebSocket(){
           stopCurrentAudio();
           updateStatus(msg.status_text);
           setAppState(AppState.SPEAKING);
-          audioPlayer.src = msg.url;
-          audioPlayer.play().catch(e => { console.error("Audio play failed:", e); setAppState(AppState.IDLE); });
+          attemptAudioPlayback(msg.url);
           break;
         case 'update_status':
           updateStatus(msg.text);
@@ -1040,6 +1120,7 @@ if (textInput) {
     if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); sendManualMessage(); }
   });
 }
+enableAudioUnlockListeners();
 renderPeopleList([]);
 renderSuggestions([]);
 setAppState(AppState.IDLE);
