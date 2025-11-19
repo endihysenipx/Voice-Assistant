@@ -563,9 +563,16 @@ let lastSpeechEvent = 0;
 let microphoneReady = false;
 let reconnectTimer = null;
 let pendingMicUnlock = false;
+let vadNoiseFloor = 0.01;
+let vadSpeechFrames = 0;
+let vadIsSpeaking = false;
 const VAD_INTERVAL_MS = 120;
 const SILENCE_HANG_MS = 700;
-const VAD_THRESHOLD = 0.018;
+const VAD_THRESHOLD = 0.02;
+const VAD_MIN_ENERGY = 0.02;
+const VAD_SIGNAL_DELTA = 0.015;
+const VAD_SPEECH_FRAMES_REQUIRED = 3;
+const VAD_NOISE_ADAPT_ALPHA = 0.04;
 const chatLog = document.getElementById('chat-log');
 const chatContainer = document.getElementById('chat-container');
 const voiceDot = document.getElementById('voice-dot');
@@ -737,8 +744,21 @@ function startVadLoop() {
     }
     const rms = Math.sqrt(sum / analyserData.length);
     const now = performance.now();
-    const speakingNow = rms > VAD_THRESHOLD;
-    if (speakingNow) {
+    const dynamicThreshold = Math.max(VAD_THRESHOLD, vadNoiseFloor + VAD_SIGNAL_DELTA);
+    const aboveThreshold = rms > dynamicThreshold && rms > VAD_MIN_ENERGY;
+
+    if (!aboveThreshold && !vadIsSpeaking) {
+      vadNoiseFloor = (1 - VAD_NOISE_ADAPT_ALPHA) * vadNoiseFloor + VAD_NOISE_ADAPT_ALPHA * rms;
+    }
+
+    if (aboveThreshold) {
+      vadSpeechFrames = Math.min(VAD_SPEECH_FRAMES_REQUIRED, vadSpeechFrames + 1);
+    } else if (vadSpeechFrames > 0) {
+      vadSpeechFrames -= 1;
+    }
+
+    if (!vadIsSpeaking && vadSpeechFrames >= VAD_SPEECH_FRAMES_REQUIRED) {
+      vadIsSpeaking = true;
       lastSpeechEvent = now;
       if (state === AppState.SPEAKING) {
         stopCurrentAudio();
@@ -752,8 +772,14 @@ function startVadLoop() {
           console.error('MediaRecorder start failure', err);
         }
       }
-    } else if (mediaRecorder && mediaRecorder.state === 'recording' && now - lastSpeechEvent > SILENCE_HANG_MS) {
-      mediaRecorder.stop();
+    } else if (vadIsSpeaking && aboveThreshold) {
+      lastSpeechEvent = now;
+    } else if (vadIsSpeaking && now - lastSpeechEvent > SILENCE_HANG_MS) {
+      vadIsSpeaking = false;
+      vadSpeechFrames = 0;
+      if (mediaRecorder && mediaRecorder.state === 'recording') {
+        mediaRecorder.stop();
+      }
     }
   }, VAD_INTERVAL_MS);
 }
@@ -791,6 +817,8 @@ async function ensureVoiceAccess() {
     }
   };
   mediaRecorder.onstop = () => {
+    vadIsSpeaking = false;
+    vadSpeechFrames = 0;
     if (!audioChunks.length) {
       setAppState(AppState.IDLE);
       return;
@@ -838,6 +866,10 @@ function stopVoiceInfrastructure() {
   audioCtx = null;
   mediaRecorder = null;
   microphoneReady = false;
+  vadNoiseFloor = 0.01;
+  vadIsSpeaking = false;
+  vadSpeechFrames = 0;
+  lastSpeechEvent = 0;
 }
 function scrollToBottom() { chatContainer.scrollTop = chatContainer.scrollHeight; }
 function appendChat(role, text) { const wrap = document.createElement('div'); wrap.className = 'bubble ' + role; if (role === 'assistant') { const pre = document.createElement('pre'); pre.textContent = text; wrap.appendChild(pre); } else { wrap.textContent = text; } chatLog.appendChild(wrap); scrollToBottom(); }
