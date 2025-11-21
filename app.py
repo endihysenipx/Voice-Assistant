@@ -475,24 +475,24 @@ CONVERSATIONAL_HTML = """
   .btn.secondary:hover { background:#6b7280; }
   .pill { display:inline-block; background:var(--chip); color:var(--chip-ink); border:1px solid var(--brand); padding:2px 8px; border-radius:999px; font-size:11px; margin-top:6px; }
   .context-display { font-size:12px; color:var(--muted); line-height:1.4; background:var(--card); padding:8px 10px; border-radius:8px; border:1px solid var(--border); }
-  .controls-bar { flex-shrink:0; padding:16px; border-top:1px solid var(--border); text-align:center; }
-  #mic-btn { width:72px; height:72px; border-radius:50%; border:0; background:var(--brand); color:white; cursor:pointer; display:inline-flex; align-items:center; justify-content:center; transition: all .2s; box-shadow: 0 0 0 0 rgba(129, 140, 248, 0); }
-  #mic-btn:disabled { background:var(--muted); cursor:not-allowed; }
-  #mic-btn.listening, #mic-btn.speaking { background:var(--red); animation: pulse 1.5s infinite; }
-  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(248, 113, 113, 0.7); } 70% { box-shadow: 0 0 0 16px rgba(248, 113, 113, 0); } 100% { box-shadow: 0 0 0 0 rgba(248, 113, 113, 0); }
-  }
-  #status-text { color:var(--muted); font-size:14px; margin-top:12px; min-height:20px; }
-  .manual-input { margin-top:12px; display:flex; gap:8px; }
+  .controls-bar { flex-shrink:0; padding:16px; border-top:1px solid var(--border); text-align:center; display:flex; flex-direction:column; align-items:center; gap:10px; }
+  #status-indicator { width: 20px; height: 20px; border-radius: 50%; background: var(--muted); transition: background 0.2s, transform 0.2s; }
+  #status-indicator.listening { background: var(--red); animation: pulse 1.5s infinite; }
+  #status-indicator.speaking { background: var(--brand); box-shadow: 0 0 10px var(--brand); }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(248, 113, 113, 0.7); } 70% { box-shadow: 0 0 0 10px rgba(248, 113, 113, 0); } 100% { box-shadow: 0 0 0 0 rgba(248, 113, 113, 0); } }
+  #status-text { color:var(--muted); font-size:14px; min-height:20px; }
+  .manual-input { width:100%; max-width:600px; display:flex; gap:8px; }
   .manual-input input { flex:1; background:var(--card); border:1px solid var(--border); border-radius:10px; padding:10px 12px; color:var(--ink); font-size:14px; }
   .manual-input input:disabled { opacity:0.6; cursor:not-allowed; }
   .manual-input .btn { flex-shrink:0; }
-  .suggestions { display:flex; flex-wrap:wrap; gap:8px; padding:12px 16px 0 16px; }
+  .suggestions { display:flex; flex-wrap:wrap; gap:8px; padding:12px 16px 0 16px; justify-content:center; }
   .suggestions.hidden { display:none; }
   .suggestion-chip { border-radius:999px; border:1px solid var(--brand); padding:8px 14px; background:var(--chip); color:var(--chip-ink); font-size:13px; cursor:pointer; transition:background-color .2s, color .2s; }
   .suggestion-chip:hover { background:var(--brand-hover); color:#fff; }
   .auth-view { padding: 24px; text-align:center; }
   .auth-view h2 { margin-top:0; }
   .auth-buttons { display: flex; justify-content: center; gap: 16px; margin-top: 16px; }
+  #start-overlay { position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(17,24,39,0.95);z-index:1000;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:20px; }
   @media (max-width: 1024px) {
     .main-layout { flex-direction:column; }
     .people-panel { width:100%; order:2; }
@@ -503,6 +503,11 @@ CONVERSATIONAL_HTML = """
   }
 </style>
 </head><body>
+<div id="start-overlay">
+  <div style="font-size:24px;font-weight:bold;color:var(--ink);">Voice Assistant</div>
+  <div style="color:var(--muted);max-width:400px;text-align:center;line-height:1.5;">Click below to enable microphone access and start the hands-free experience.</div>
+  <button id="start-btn" class="btn" style="font-size:18px;padding:12px 32px;">Start Session</button>
+</div>
 <div id="app-container" class="app-container">
   <header>
     <h1><span id="service-name">Email</span> Assistant</h1><span class="badge">Voice AI</span>
@@ -530,10 +535,10 @@ CONVERSATIONAL_HTML = """
     </div>
   </div>
   <div id="controls" class="controls-bar" style="display:none;">
-    <button id="mic-btn" onclick="handleMicClick()" disabled>
-      <span id="mic-icon-container"></span>
-    </button>
-    <div id="status-text">Checking connection...</div>
+    <div style="display:flex;align-items:center;gap:12px;">
+        <div id="status-indicator"></div>
+        <div id="status-text">Checking connection...</div>
+    </div>
     <div class="manual-input">
       <input id="text-input" type="text" placeholder="Type a message..." autocomplete="off"/>
       <button id="send-btn" class="btn secondary" onclick="sendManualMessage()">Send</button>
@@ -544,11 +549,76 @@ CONVERSATIONAL_HTML = """
 <script>
 const AppState = { IDLE: 'IDLE', LISTENING: 'LISTENING', PROCESSING: 'PROCESSING', SPEAKING: 'SPEAKING' };
 let state = AppState.IDLE; let socket; let mediaRecorder; let audioChunks = [];
-const chatLog = document.getElementById('chat-log'); const chatContainer = document.getElementById('chat-container'); const micBtn = document.getElementById('mic-btn'); const micIconContainer = document.getElementById('mic-icon-container'); const statusText = document.getElementById('status-text'); const audioPlayer = document.getElementById('audio-player');
+let audioContext, analyser, microphone, scriptProcessor;
+let isVADActive = false; let vadStream = null;
+const chatLog = document.getElementById('chat-log'); const chatContainer = document.getElementById('chat-container');
+const statusText = document.getElementById('status-text'); const statusIndicator = document.getElementById('status-indicator');
+const audioPlayer = document.getElementById('audio-player');
 const suggestionsWrap = document.getElementById('suggestions-wrap'); const textInput = document.getElementById('text-input'); const sendBtn = document.getElementById('send-btn'); const peoplePanel = document.getElementById('people-panel'); const peopleList = document.getElementById('people-list');
 const authView = document.getElementById('auth-view'); const controls = document.getElementById('controls'); const authButtons = document.getElementById('auth-buttons');
 const authMsg = document.getElementById('auth-msg'); const connectGoogle = document.getElementById('connect-google'); const connectOutlook = document.getElementById('connect-outlook'); const serviceNameElem = document.getElementById('service-name');
-const ICONS = { mic: `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>`, stop: `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect></svg>`};
+const startOverlay = document.getElementById('start-overlay'); const startBtn = document.getElementById('start-btn');
+
+startBtn.addEventListener('click', async () => {
+    startOverlay.style.display = 'none';
+    await initAudio();
+    checkAuth();
+});
+
+async function initAudio() {
+    try {
+        vadStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        analyser = audioContext.createAnalyser();
+        microphone = audioContext.createMediaStreamSource(vadStream);
+        scriptProcessor = audioContext.createScriptProcessor(2048, 1, 1);
+
+        analyser.smoothingTimeConstant = 0.3;
+        analyser.fftSize = 1024;
+
+        microphone.connect(analyser);
+        analyser.connect(scriptProcessor);
+        scriptProcessor.connect(audioContext.destination);
+
+        let silenceStart = Date.now();
+        let isSpeaking = false;
+        const SPEECH_THRESHOLD = 15; // Sensitivity
+        const SILENCE_DELAY = 1200; // ms to wait before sending
+
+        scriptProcessor.onaudioprocess = function() {
+            if (state === AppState.PROCESSING) return; // Don't listen while thinking
+            
+            const array = new Uint8Array(analyser.frequencyBinCount);
+            analyser.getByteFrequencyData(array);
+            let values = 0;
+            const length = array.length;
+            for (let i = 0; i < length; i++) values += array[i];
+            const average = values / length;
+
+            if (average > SPEECH_THRESHOLD) {
+                if (!isSpeaking) {
+                    isSpeaking = true;
+                    console.log("VAD: Speech started");
+                    if (state === AppState.SPEAKING) {
+                        stopCurrentAudio(); // Interrupt
+                    }
+                    startRecording();
+                }
+                silenceStart = Date.now();
+            } else {
+                if (isSpeaking && Date.now() - silenceStart > SILENCE_DELAY) {
+                    isSpeaking = false;
+                    console.log("VAD: Speech ended");
+                    stopRecording();
+                }
+            }
+        };
+        isVADActive = true;
+    } catch (e) {
+        console.error("Audio Init Error:", e);
+        updateStatus("Microphone access denied.");
+    }
+}
 
 function renderPeopleList(items){
   if (!peoplePanel || !peopleList) return;
@@ -701,15 +771,14 @@ function showDraft(to, subject, body){ const draftWrap = document.getElementById
 function hideDraft(){ document.getElementById('draft-wrap').style.display = 'none'; }
 function updateStatus(text){ statusText.textContent = text; }
 function stopCurrentAudio() { audioPlayer.pause(); audioPlayer.src = ''; }
-async function startRecording() {
+function startRecording() {
+  if (!vadStream) return;
   try {
     stopCurrentAudio();
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     const mimeType = MediaRecorder.isTypeSupported('audio/webm; codecs=opus') ? 'audio/webm; codecs=opus' : 'audio/webm';
-    mediaRecorder = new MediaRecorder(stream, { mimeType }); audioChunks = [];
+    mediaRecorder = new MediaRecorder(vadStream, { mimeType }); audioChunks = [];
     mediaRecorder.ondataavailable = e => { if (e.data && e.data.size > 0) audioChunks.push(e.data); };
     mediaRecorder.onstop = () => {
-      stream.getTracks().forEach(t => t.stop());
       if (socket && socket.readyState === WebSocket.OPEN && audioChunks.length > 0) {
         const audioBlob = new Blob(audioChunks, { type: mimeType });
         socket.send(audioBlob);
