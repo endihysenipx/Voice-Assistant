@@ -727,29 +727,31 @@ function renderSuggestions(items){
 }
 
 function setAppState(newState) {
-  state = newState; micBtn.classList.remove('listening', 'speaking');
+  state = newState;
+  statusIndicator.classList.remove('listening', 'speaking');
   switch (state) {
-    case AppState.IDLE: micIconContainer.innerHTML = ICONS.mic; micBtn.disabled = false; updateStatus('Tap the mic to start.'); break;
-    case AppState.LISTENING: micIconContainer.innerHTML = ICONS.stop; micBtn.classList.add('listening'); micBtn.disabled = false; updateStatus('Listening... tap to stop.'); break;
-    case AppState.PROCESSING: micIconContainer.innerHTML = ICONS.mic; micBtn.disabled = true; updateStatus('Thinking...'); break;
-    case AppState.SPEAKING: micIconContainer.innerHTML = ICONS.stop; micBtn.classList.add('speaking'); micBtn.disabled = false; break;
+    case AppState.IDLE: 
+        statusIndicator.style.background = 'var(--muted)'; 
+        updateStatus('Ready. Just start talking...'); 
+        break;
+    case AppState.LISTENING: 
+        statusIndicator.classList.add('listening'); 
+        updateStatus('Listening...'); 
+        break;
+    case AppState.PROCESSING: 
+        statusIndicator.style.background = 'var(--chip)'; 
+        updateStatus('Thinking...'); 
+        break;
+    case AppState.SPEAKING: 
+        statusIndicator.classList.add('speaking'); 
+        break;
   }
   const socketReady = socket && socket.readyState === WebSocket.OPEN;
   const disableManual = !socketReady || state === AppState.LISTENING || state === AppState.PROCESSING;
   if (textInput) textInput.disabled = disableManual;
   if (sendBtn) sendBtn.disabled = disableManual;
 }
-function handleMicClick() {
-  renderSuggestions([]);
-  switch (state) {
-    case AppState.IDLE:
-      if (!socket || socket.readyState !== WebSocket.OPEN) { connectWebSocket().then(startRecording); }
-      else { startRecording(); }
-      break;
-    case AppState.LISTENING: stopRecording(); break;
-    case AppState.SPEAKING: stopCurrentAudio(); setAppState(AppState.IDLE); break;
-  }
-}
+
 function scrollToBottom() { chatContainer.scrollTop = chatContainer.scrollHeight; }
 function appendChat(role, text) { const wrap = document.createElement('div'); wrap.className = 'bubble ' + role; if (role === 'assistant') { const pre = document.createElement('pre'); pre.textContent = text; wrap.appendChild(pre); } else { wrap.textContent = text; } chatLog.appendChild(wrap); scrollToBottom(); }
 function updateContext(info) {
@@ -832,7 +834,6 @@ async function checkAuth(){
     renderPeopleList([]);
     if (!anyAvailable) {
       updateStatus('Waiting for server configuration...');
-      if (micBtn) micBtn.disabled = true;
     } else {
       updateStatus('Tap Connect to link Gmail or Outlook.');
     }
@@ -841,7 +842,6 @@ async function checkAuth(){
     if (controls) controls.style.display = 'block';
     serviceNameElem.textContent = payload.connected_service === 'google' ? 'Gmail' : 'Outlook';
     renderPeopleList([]);
-    micBtn.disabled = false;
     connectWebSocket();
   }
 }
@@ -881,7 +881,7 @@ renderSuggestions([]);
 setAppState(AppState.IDLE);
 checkAuth();
 </script>
-</body></html>
+"""</body></html>
 """
 
 # ======================= OpenAI & API Helpers =======================
